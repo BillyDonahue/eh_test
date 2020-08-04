@@ -18,6 +18,8 @@
 
 namespace {
 
+bool kVerboseHeaders = false;
+
 const std::string kElfMagic = std::string(ELFMAG, SELFMAG);
 const std::string kSectionEhFrame = ".eh_frame";
 
@@ -36,12 +38,24 @@ std::ostream& hexDump(std::ostream& os, const std::string& label, const void* p,
     if (label.size())
         os << label << ": ";
     os << "[";
+
+    bool multiLine = (n >= 16);
+    if (multiLine)
+        os << "\n    ";
+    int col = 0;
     for (; n--; ++cp) {
         os << sep;
         os << std::setw(2) << +*cp;
         sep = " ";
+        if (++col == 16) {
+            os << "\n    ";
+            col = 0;
+            sep = "";
+        }
     }
     os << std::dec;
+    if (multiLine)
+        os << "\n";
     os << "]";
     return os;
 }
@@ -59,7 +73,7 @@ std::string hexString(const std::string& s) {
 template <typename T>
 std::string hexInt(T v) {
     std::ostringstream oss;
-    oss << std::hex << std::showbase << v;
+    oss << std::hex << std::showbase << +v;
     return oss.str();
 }
 
@@ -103,24 +117,26 @@ public:
         hexDump(std::cout, "    ei_abiversion", &ident[EI_ABIVERSION], 1) << "\n";
         std::cout << "  }\n";
 
-        auto hdrDump = [](const char* field, auto x) {
-            std::cout << "  ." << field << ": " << hexInt(x) << "\n";
-        };
+        if (kVerboseHeaders) {
+            auto hdrDump = [](const char* field, auto x) {
+                std::cout << "  ." << field << ": " << hexInt(x) << "\n";
+            };
 #define HDRF_(f) hdrDump(#f, eHeader.f);
-        HDRF_(e_type)             /* Object file type */
-        HDRF_(e_machine)          /* Architecture */
-        HDRF_(e_version)          /* Object file version */
-        HDRF_(e_entry)            /* Entry point virtual address */
-        HDRF_(e_phoff)            /* Program header table file offset */
-        HDRF_(e_shoff)            /* Section header table file offset */
-        HDRF_(e_flags)            /* Processor-specific flags */
-        HDRF_(e_ehsize)           /* ELF header size in bytes */
-        HDRF_(e_phentsize)        /* Program header table entry size */
-        HDRF_(e_phnum)            /* Program header table entry count */
-        HDRF_(e_shentsize)        /* Section header table entry size */
-        HDRF_(e_shnum)            /* Section header table entry count */
-        HDRF_(e_shstrndx)         /* Section header string table index */
+            HDRF_(e_type)             /* Object file type */
+            HDRF_(e_machine)          /* Architecture */
+            HDRF_(e_version)          /* Object file version */
+            HDRF_(e_entry)            /* Entry point virtual address */
+            HDRF_(e_phoff)            /* Program header table file offset */
+            HDRF_(e_shoff)            /* Section header table file offset */
+            HDRF_(e_flags)            /* Processor-specific flags */
+            HDRF_(e_ehsize)           /* ELF header size in bytes */
+            HDRF_(e_phentsize)        /* Program header table entry size */
+            HDRF_(e_phnum)            /* Program header table entry count */
+            HDRF_(e_shentsize)        /* Section header table entry size */
+            HDRF_(e_shnum)            /* Section header table entry count */
+            HDRF_(e_shstrndx)         /* Section header string table index */
 #undef HDRF_
+        }
     }
 
     void scanProgramHeaders() {
@@ -135,55 +151,55 @@ public:
             }
             memcpy(&pHeader, image.data() + pho, sizeof(pHeader));
 
-            std::cout << "Program segment header [" << phi << "], offset:" << hexInt(pho) << ": {\n";
-
-            auto hdrDump = [](const char* field, auto x) -> std::ostream& {
-                return std::cout << "  ." << field << ": " << hexInt(x) << "\n";
-            };
+            if (kVerboseHeaders) {
+                std::cout << "Program segment header [" << phi << "], offset:" << hexInt(pho) << ": {\n";
+                auto hdrDump = [](const char* field, auto x) -> std::ostream& {
+                    return std::cout << "  ." << field << ": " << hexInt(x) << "\n";
+                };
 #define HDRF_(f) hdrDump(#f, pHeader.f)
-            HDRF_(p_type);         /* Segment type */
-            HDRF_(p_flags);        /* Segment flags */
-            HDRF_(p_offset);       /* Segment file offset */
-            HDRF_(p_vaddr);        /* Segment virtual address */
-            HDRF_(p_paddr);        /* Segment physical address */
-            HDRF_(p_filesz);       /* Segment size in file */
-            HDRF_(p_memsz);        /* Segment size in memory */
-            HDRF_(p_align);        /* Segment alignment */
+                HDRF_(p_type);         /* Segment type */
+                HDRF_(p_flags);        /* Segment flags */
+                HDRF_(p_offset);       /* Segment file offset */
+                HDRF_(p_vaddr);        /* Segment virtual address */
+                HDRF_(p_paddr);        /* Segment physical address */
+                HDRF_(p_filesz);       /* Segment size in file */
+                HDRF_(p_memsz);        /* Segment size in memory */
+                HDRF_(p_align);        /* Segment alignment */
 #undef HDRF_
-
-            struct {
-                Elf64_Word t;
-                std::string name;
-            } static const ptypes[] = {
+                struct {
+                    Elf64_Word t;
+                    std::string name;
+                } static const pTypes[] = {
 #define TTE_(s) {s, #s}
-                TTE_(PT_NULL),
-                TTE_(PT_LOAD),
-                TTE_(PT_DYNAMIC),
-                TTE_(PT_INTERP),
-                TTE_(PT_NOTE),
-                TTE_(PT_SHLIB),
-                TTE_(PT_PHDR),
-                TTE_(PT_TLS),
-                TTE_(PT_NUM),
-                TTE_(PT_LOOS),
-                TTE_(PT_GNU_EH_FRAME),
-                TTE_(PT_GNU_STACK),
-                TTE_(PT_GNU_RELRO),
-                TTE_(PT_LOSUNW),
-                TTE_(PT_SUNWBSS),
-                TTE_(PT_SUNWSTACK),
-                TTE_(PT_HISUNW),
-                TTE_(PT_HIOS),
-                TTE_(PT_LOPROC),
-                TTE_(PT_HIPROC),
+                    TTE_(PT_NULL),
+                    TTE_(PT_LOAD),
+                    TTE_(PT_DYNAMIC),
+                    TTE_(PT_INTERP),
+                    TTE_(PT_NOTE),
+                    TTE_(PT_SHLIB),
+                    TTE_(PT_PHDR),
+                    TTE_(PT_TLS),
+                    TTE_(PT_NUM),
+                    TTE_(PT_LOOS),
+                    TTE_(PT_GNU_EH_FRAME),
+                    TTE_(PT_GNU_STACK),
+                    TTE_(PT_GNU_RELRO),
+                    TTE_(PT_LOSUNW),
+                    TTE_(PT_SUNWBSS),
+                    TTE_(PT_SUNWSTACK),
+                    TTE_(PT_HISUNW),
+                    TTE_(PT_HIOS),
+                    TTE_(PT_LOPROC),
+                    TTE_(PT_HIPROC),
 #undef TTE_
-            };
-            for (auto&& pt : ptypes) {
-                if (pHeader.p_type == pt.t) {
-                    std::cout << "     [type: " << pt.name << "]\n";
+                };
+                for (auto&& pt : pTypes) {
+                    if (pHeader.p_type == pt.t) {
+                        std::cout << "     [type: " << pt.name << "]\n";
+                    }
                 }
+                std::cout << "}\n";
             }
-            std::cout << "}\n";
             pHeaders.push_back({pho, pHeader});
         }
     }
@@ -207,30 +223,153 @@ public:
         const char* strTab = &image[strTabSec.sh_offset];
         for (auto&& s : sHeaders) {
             s.name = std::string(strTab + s.sHeader.sh_name);
-            // std::cout << "  section name: " << s.name << "\n";
         }
 
-        for (size_t shi = 0; shi != sHeaders.size(); ++shi) {
-            const auto& s = sHeaders[shi];
-            std::cout << "Section header [" << shi << "]"
-                ", name: \"" << s.name << "\""
-                ", offset:" << hexInt(s.fOffset) << ": {\n";
-            auto hdrDump = [](const char* field, auto x) -> std::ostream& {
-                return std::cout << "  ." << field << ": " << hexInt(x) << "\n";
-            };
+        if (kVerboseHeaders) {
+            for (size_t shi = 0; shi != sHeaders.size(); ++shi) {
+                const auto& s = sHeaders[shi];
+                std::cout << "Section header [" << shi << "]"
+                    ", name: \"" << s.name << "\""
+                    ", offset:" << hexInt(s.fOffset) << ": {\n";
+                auto hdrDump = [](const char* field, auto x) -> std::ostream& {
+                    return std::cout << "  ." << field << ": " << hexInt(x) << "\n";
+                };
 #define HDRF_(f) hdrDump(#f, s.sHeader.f)
-            HDRF_(sh_name);                /* Section name (string tbl index) */
-            HDRF_(sh_type);                /* Section type */
-            HDRF_(sh_flags);               /* Section flags */
-            HDRF_(sh_addr);                /* Section virtual addr at execution */
-            HDRF_(sh_offset);              /* Section file offset */
-            HDRF_(sh_size);                /* Section size in bytes */
-            HDRF_(sh_link);                /* Link to another section */
-            HDRF_(sh_info);                /* Additional section information */
-            HDRF_(sh_addralign);           /* Section alignment */
-            HDRF_(sh_entsize);             /* Entry size if section holds table */
+                HDRF_(sh_name);                /* Section name (string tbl index) */
+                HDRF_(sh_type);                /* Section type */
+                HDRF_(sh_flags);               /* Section flags */
+                HDRF_(sh_addr);                /* Section virtual addr at execution */
+                HDRF_(sh_offset);              /* Section file offset */
+                HDRF_(sh_size);                /* Section size in bytes */
+                HDRF_(sh_link);                /* Link to another section */
+                HDRF_(sh_info);                /* Additional section information */
+                HDRF_(sh_addralign);           /* Section alignment */
+                HDRF_(sh_entsize);             /* Entry size if section holds table */
 #undef HDRF_
-            std::cout << "}\n";
+                std::cout << "}\n";
+            }
+        }
+    }
+
+    void load() {
+        scanElfHeader();
+        std::cout << std::endl;
+        scanProgramHeaders();
+        std::cout << std::endl;
+        scanSectionHeaders();
+    }
+
+    const SectionHeader* findSection(const std::string& name) const {
+        for (auto&& s : sHeaders)
+            if (s.name == name)
+                return &s;
+        return nullptr;
+    }
+
+    void dumpEhFrame() {
+        auto secHeader = findSection(kSectionEhFrame);
+        if (!secHeader)
+            throw std::runtime_error("missing .eh_frame section");
+        size_t secSize = secHeader->sHeader.sh_size;
+        std::cout << "\"" << secHeader->name << "\"" << std::endl;
+        const char* sectionData = &image[secHeader->sHeader.sh_offset];
+        std::cout << "=====" << std::endl;
+
+        hexDump(std::cout, ".eh_frame section", sectionData, std::min(secSize, size_t{1} << 10)) << "\n";
+
+        // 1 or more CIE, read while `pos < secSize`.
+        size_t pos = 0;
+
+        // CFI:
+        //   Common Information Entry Record
+        //   Frame Description Entry Record(s)
+        struct Cie {
+            size_t length;
+            // [4] Length    Required
+            // [?8] Extended Length    Optional (if length==0xffffffff)
+            uint32_t cieId; // [4] CIE ID    Required
+            uint8_t version;
+            std::string augmentationString;
+
+            bool hasEhData;
+            uint64_t ehData;  // EH Data Optional (present if "eh" appears in augmentationString)
+
+            uint64_t codeAlign;  // Code Alignment Factor    Required LEB128
+            uint64_t dataAlign;  // Data Alignment Factor    Required LEB128
+            uint64_t returnRegister;  // Return Address Register    Required
+
+            // Augmentation Data Length    Optional
+            // Augmentation Data    Optional
+
+            // Initial Instructions    Required
+        };
+
+        while (pos < secSize) {
+            Cie cie{};
+
+            std::cout << "CFI record:\n";
+
+            {
+                uint32_t val;
+                memcpy(&val, sectionData + pos, sizeof(val));
+                pos += sizeof(val);
+                cie.length = val;
+            }
+
+            if (cie.length == 0) {
+                std::cout << "CIE length==0 terminator";
+            }
+
+            if (cie.length == 0xffff'ffff) {
+                uint64_t val;
+                memcpy(&val, sectionData + pos, sizeof(val));
+                pos += sizeof(val);
+                cie.length = val;
+            }
+
+            std::cout << "  .length: " << hexInt(cie.length) << "\n";
+
+            const char* cieBegin = sectionData + pos;
+            const char* cieEnd = cieBegin + cie.length;
+            pos += cie.length;
+            const char* ciePtr = cieBegin;
+
+            hexDump(std::cout, "  .data", cieBegin, cieEnd - cieBegin) << "\n";
+
+            {
+                uint32_t val;
+                memcpy(&val, ciePtr, sizeof(val));
+                ciePtr += sizeof(val);
+                cie.cieId = val;
+            }
+
+            if (cie.cieId != 0) {
+                std::cout << "  [skip non-CIE record with id " << hexInt(cie.cieId) << "]\n";
+                continue;
+            }
+
+            {
+                uint8_t val;
+                memcpy(&val, ciePtr, sizeof(val));
+                ciePtr += sizeof(val);
+                cie.version = val;
+            }
+
+            for (; *ciePtr; ++ciePtr)
+                cie.augmentationString.push_back(*ciePtr);
+
+            if (cie.hasEhData = (cie.augmentationString.find("eh") != std::string::npos)) {
+                uint64_t val;
+                memcpy(&val, ciePtr, sizeof(val));
+                ciePtr += sizeof(val);
+                cie.ehData = val;
+            }
+
+            std::cout << "  .version: " << hexInt(cie.version) << "\n";
+            std::cout << "  .augmentationString: \"" << cie.augmentationString << "\"\n";
+            if (cie.hasEhData) {
+                std::cout << "  .ehData: \"" << hexInt(cie.ehData) << "\"\n";
+            }
         }
     }
 
@@ -258,10 +397,9 @@ int main(int argc, char** argv) {
         << elfData.size() << std::noshowbase << std::dec << ")\n";
 
     ElfScan elfScan(std::move(elfData));
-    elfScan.scanElfHeader();
-    std::cout << std::endl;
-    elfScan.scanProgramHeaders();
-    std::cout << std::endl;
-    elfScan.scanSectionHeaders();
+    elfScan.load();
+
+    elfScan.dumpEhFrame();
+
     return 0;
 }
