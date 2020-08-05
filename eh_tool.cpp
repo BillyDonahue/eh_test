@@ -22,6 +22,12 @@
 
 namespace {
 
+// gcc extension: 
+// https://code.woboq.org/llvm/compiler-rt/lib/builtins/gcc_personality_v0.c.html#_M/DW_EH_PE_indirect
+#ifndef DW_EH_PE_indirect
+#define DW_EH_PE_indirect 0x80
+#endif
+
 bool kVerboseHeaders = false;
 
 const std::string kElfMagic = std::string(ELFMAG, SELFMAG);
@@ -103,7 +109,7 @@ std::string encStr(uint8_t encoding) {
         default: part("[lower:?]"); break;
     }
     // upper nybble: application
-    switch (encoding & 0xf0) {
+    switch (encoding & 0x70) {
         P_(DW_EH_PE_pcrel)
         P_(DW_EH_PE_textrel)
         P_(DW_EH_PE_datarel)
@@ -111,6 +117,8 @@ std::string encStr(uint8_t encoding) {
         P_(DW_EH_PE_aligned)
         default: part("[upper:?]"); break;
     }
+    if (encoding & DW_EH_PE_indirect)
+        part("DW_EH_PE_indirect");
 #undef P_
 
     std::string result = hexInt(encoding) + ": [";
