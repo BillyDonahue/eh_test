@@ -18,6 +18,8 @@
 #include <elf.h>
 #include <libdwarf/dwarf.h>
 
+#include <fmt/format.h>
+
 namespace {
 
 bool kVerboseHeaders = false;
@@ -87,8 +89,8 @@ std::string encStr(uint8_t encoding) {
     auto part = [&](auto&& s) { parts.push_back(s); };
 
 #define P_(x) case x: part(#x); break;
-    // upper nybble
-    switch ((encoding>>4) & 0xf) {
+    // lower nybble: value format
+    switch (encoding & 0x0f) {
         P_(DW_EH_PE_absptr)
         P_(DW_EH_PE_uleb128)
         P_(DW_EH_PE_udata2)
@@ -98,14 +100,16 @@ std::string encStr(uint8_t encoding) {
         P_(DW_EH_PE_sdata2)
         P_(DW_EH_PE_sdata4)
         P_(DW_EH_PE_sdata8)
+        default: part("[lower:?]"); break;
     }
-    // lower nybble
-    switch ((encoding>>0) & 0xf) {
+    // upper nybble: application
+    switch (encoding & 0xf0) {
         P_(DW_EH_PE_pcrel)
         P_(DW_EH_PE_textrel)
         P_(DW_EH_PE_datarel)
         P_(DW_EH_PE_funcrel)
         P_(DW_EH_PE_aligned)
+        default: part("[upper:?]"); break;
     }
 #undef P_
 
@@ -151,6 +155,77 @@ int64_t decodeSLEB128(const char** data) {
     return val;
 }
 
+uint64_t dwarfDecode(uint8_t encoding, const char* data, size_t& offset) {
+    uint64_t r = 0;
+    // Low nybble determines numeric encoding
+    switch (encoding & 0xf) {
+        case DW_EH_PE_uleb128:
+            {
+                const char* dataTmp = data + offset;
+                r = static_cast<uint64_t>(decodeULEB128(&dataTmp));
+                offset = dataTmp - data;
+            }
+            break;
+        case DW_EH_PE_udata2:
+            {
+                uint16_t t;
+                memcpy(&t, data + offset, sizeof(t));
+                offset += sizeof(t);
+                r = t;
+            }
+            break;
+        case DW_EH_PE_udata4:
+            {
+                uint32_t t;
+                memcpy(&t, data + offset, sizeof(t));
+                offset += sizeof(t);
+                r = t;
+            }
+            break;
+        case DW_EH_PE_udata8:
+        case DW_EH_PE_absptr:
+            {
+                uint64_t t;
+                memcpy(&t, data + offset, sizeof(t));
+                offset += sizeof(t);
+                r = t;
+            }
+            break;
+        case DW_EH_PE_sleb128:
+            {
+                const char* dataTmp = data + offset;
+                r = static_cast<uint64_t>(decodeSLEB128(&dataTmp));
+                offset = dataTmp - data;
+            }
+            break;
+        case DW_EH_PE_sdata2:
+            {
+                int16_t t;
+                memcpy(&t, data + offset, 2);
+                offset += 2;
+                r = static_cast<uint64_t>(static_cast<int64_t>(t));
+            }
+            break;
+        case DW_EH_PE_sdata4:
+            {
+                int32_t t;
+                memcpy(&t, data + offset, 4);
+                offset += 4;
+                r = static_cast<uint64_t>(static_cast<int64_t>(t));
+            }
+            break;
+        case DW_EH_PE_sdata8:
+            {
+                int64_t t;
+                memcpy(&t, data + offset, 8);
+                offset += 8;
+                r = static_cast<uint64_t>(static_cast<int64_t>(t));
+            }
+            break;
+    }
+    return r;
+}
+
 // CFI:
 //   Common Information Entry Record
 //   Frame Description Entry Record(s)
@@ -174,8 +249,10 @@ struct Cie {
     uint8_t personalityEnc;  // Personality function's encoding.
     uint8_t addressEnc;  // encoding for addresses in the FDEs
 
+    uint64_t personality;
+
     bool hasEhData() const { return augmentationString.find("eh") != std::string::npos; }
-    bool hasAugmentation() const { return augmentationString.find("z") == 0; }
+    bool hasAugmentation() const { return augmentationString.find('z') == 0; }
 
     // Initial Instructions    Required
 };
@@ -225,7 +302,7 @@ void scanCfe(const char *sectionData, size_t secSize) {
         pos += cie.length;
         const char* ciePtr = cieBegin;
 
-        // hexDump(std::cout, "  .data", cieBegin, cieEnd - cieBegin) << "\n";
+        hexDump(std::cout, "  .data", cieBegin, cieEnd - cieBegin) << "\n";
 
         {
             uint32_t val;
@@ -248,6 +325,8 @@ void scanCfe(const char *sectionData, size_t secSize) {
             cie.version = val;
         }
         std::cout << "  .version: " << hexInt(cie.version) << "\n";
+
+        std::cout << fmt::format("  .version: {:x}\n", cie.version);
 
         for (; *ciePtr; ++ciePtr)
             cie.augmentationString.push_back(*ciePtr);
@@ -288,8 +367,13 @@ void scanCfe(const char *sectionData, size_t secSize) {
                         std::cout << "    .lsdaEnc: " << encStr(cie.lsdaEnc) << "\n";
                         break;
                     case 'P':
+                        // Encodes two things in data. An encoding spec for a pointer, then the pointer.
                         cie.personalityEnc = cie.augmentationData[dataPos++];
                         std::cout << "    .personalityEnc: " << encStr(cie.personalityEnc) << "\n";
+                        cie.personality = dwarfDecode(cie.personalityEnc,
+                                                      cie.augmentationData.data(),
+                                                      dataPos);
+                        std::cout << "    .personality: " << hexInt(cie.personality) << "\n";
                         break;
                     case 'R':
                         cie.addressEnc = cie.augmentationData[dataPos++];
