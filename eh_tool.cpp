@@ -7,6 +7,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <optional>
 #include <cstdlib>
 #include <cstring>
 #include <sstream>
@@ -15,6 +16,7 @@
 #include <cassert>
 
 #include <elf.h>
+#include <libdwarf/dwarf.h>
 
 namespace {
 
@@ -76,6 +78,236 @@ std::string hexInt(T v) {
     oss << std::hex << std::showbase << +v;
     return oss.str();
 }
+
+std::string encStr(uint8_t encoding) {
+    std::vector<std::string> parts;
+    if (encoding == DW_EH_PE_omit)
+        return "DW_EH_PE_omit";
+
+    auto part = [&](auto&& s) { parts.push_back(s); };
+
+#define P_(x) case x: part(#x); break;
+    // upper nybble
+    switch ((encoding>>4) & 0xf) {
+        P_(DW_EH_PE_absptr)
+        P_(DW_EH_PE_uleb128)
+        P_(DW_EH_PE_udata2)
+        P_(DW_EH_PE_udata4)
+        P_(DW_EH_PE_udata8)
+        P_(DW_EH_PE_sleb128)
+        P_(DW_EH_PE_sdata2)
+        P_(DW_EH_PE_sdata4)
+        P_(DW_EH_PE_sdata8)
+    }
+    // lower nybble
+    switch ((encoding>>0) & 0xf) {
+        P_(DW_EH_PE_pcrel)
+        P_(DW_EH_PE_textrel)
+        P_(DW_EH_PE_datarel)
+        P_(DW_EH_PE_funcrel)
+        P_(DW_EH_PE_aligned)
+    }
+#undef P_
+
+    std::string result = hexInt(encoding) + ": [";
+    const char* sep = "";
+    for (auto&& p : parts) {
+        result += sep;
+        result += p;
+        sep = " | ";
+    }
+    result += "]";
+    return result;
+}
+
+uint64_t decodeULEB128(const char** data) {
+    const char*& in = *data;
+    uint64_t val = 0;
+    int shift = 0;
+    uint64_t c;
+    do {
+        c = static_cast<unsigned char>(*in++);
+        // std::cout << "peek: " << hexInt(c) << "\n";
+        val |= (c & 0x7f) << shift;
+        if (!(c & 0x80))
+            break;
+        shift += 7;
+    } while (c & 0x80);
+    return val;
+}
+
+int64_t decodeSLEB128(const char** data) {
+    const char*& in = *data;
+    int64_t val = 0;
+    int64_t shift = 0;
+    int64_t c;
+    do {
+        c = *in++;
+        val |= (c & 0x7f) << shift;
+        shift += 7;
+    } while (c & 0x80);
+    if (c & 0x40)
+        val |= static_cast<int64_t>((~uint64_t{0}) << shift);
+    return val;
+}
+
+// CFI:
+//   Common Information Entry Record
+//   Frame Description Entry Record(s)
+
+struct Cie {
+    size_t pos;  // starting offset within section
+
+    uint64_t length; // [4] Length    Required
+                     // [?8] Extended Length    present iff length == 0xffffffff
+    uint32_t cieId; // [4] CIE ID    Required
+    uint8_t version;
+    std::string augmentationString;
+    uint64_t ehData;  // EH Data Optional (present if "eh" appears in augmentationString)
+    uint64_t codeAlign;  // Code Alignment Factor Required ULEB128
+    int64_t dataAlign;   // Data Alignment Factor Required SLEB128
+    uint8_t returnRegister;  // Return Address Register ?   Required
+    std::string augmentationData;  // format keyed by augmentationString
+    std::string instructions;  // initial call frame dwarf instructions
+
+    uint8_t lsdaEnc; // encoding for LSDA pointers in the FDEs
+    uint8_t personalityEnc;  // Personality function's encoding.
+    uint8_t addressEnc;  // encoding for addresses in the FDEs
+
+    bool hasEhData() const { return augmentationString.find("eh") != std::string::npos; }
+    bool hasAugmentation() const { return augmentationString.find("z") == 0; }
+
+    // Initial Instructions    Required
+};
+
+struct Fde {
+};
+
+void scanFde(const char *sectionData, size_t secSize) {
+}
+
+void scanCfe(const char *sectionData, size_t secSize) {
+    // hexDump(std::cout, ".eh_frame section", sectionData, std::min(secSize, size_t{1} << 10)) << "\n";
+
+    // 1 or more CIE, read while `pos < secSize`.
+    size_t pos = 0;
+
+    std::vector<Cie> cieVec;
+
+    while (pos < secSize) {
+        Cie cie{};
+        cie.pos = pos;
+        std::cout << "\n";
+        std::cout << "[CFI] pos: " << hexInt(pos) << std::endl;
+        {
+            uint32_t val;
+            memcpy(&val, sectionData + pos, sizeof(val));
+            pos += sizeof(val);
+            cie.length = val;
+        }
+
+        if (cie.length == 0) {
+            std::cout << "[TERMINATOR, length==0]" << std::endl;
+            break;
+        }
+
+        if (cie.length == 0xffff'ffff) {
+            uint64_t val;
+            memcpy(&val, sectionData + pos, sizeof(val));
+            pos += sizeof(val);
+            cie.length = val;
+        }
+
+        // std::cout << "  .length: " << hexInt(cie.length) << "\n";
+
+        const char* cieBegin = sectionData + pos;
+        const char* cieEnd = cieBegin + cie.length;
+        pos += cie.length;
+        const char* ciePtr = cieBegin;
+
+        // hexDump(std::cout, "  .data", cieBegin, cieEnd - cieBegin) << "\n";
+
+        {
+            uint32_t val;
+            memcpy(&val, ciePtr, sizeof(val));
+            ciePtr += sizeof(val);
+            cie.cieId = val;
+        }
+
+        if (cie.cieId != 0) {
+            std::cout << "  [FDE]\n";
+            // Handle FDE's.
+            continue;
+        }
+        std::cout << "  [CIE]\n";
+
+        {
+            uint8_t val;
+            memcpy(&val, ciePtr, sizeof(val));
+            ciePtr += sizeof(val);
+            cie.version = val;
+        }
+        std::cout << "  .version: " << hexInt(cie.version) << "\n";
+
+        for (; *ciePtr; ++ciePtr)
+            cie.augmentationString.push_back(*ciePtr);
+        ++ciePtr;  // nul
+        std::cout << "  .augmentationString: \"" << cie.augmentationString << "\"\n";
+
+        if (cie.hasEhData()) {
+            uint64_t val;
+            memcpy(&val, ciePtr, sizeof(val));
+            ciePtr += sizeof(val);
+            cie.ehData = val;
+            std::cout << "  .ehData: \"" << hexInt(cie.ehData) << "\"\n";
+        }
+
+        cie.codeAlign = decodeULEB128(&ciePtr);
+        std::cout << "  .codeAlign: " << cie.codeAlign << "\n";
+
+        cie.dataAlign = decodeSLEB128(&ciePtr);
+        std::cout << "  .dataAlign: " << cie.dataAlign << "\n";
+
+        cie.returnRegister = *ciePtr++;
+        std::cout << "  .returnRegister: " << hexInt(cie.returnRegister) << "\n";
+
+        if (cie.hasAugmentation()) {
+            uint64_t len = decodeULEB128(&ciePtr);
+            cie.augmentationData.assign(ciePtr, len);
+            ciePtr += len;
+            // Contents' meaning determined by augmentationString
+            std::cout << "  .augmentation[" << hexInt(cie.augmentationData.size()) << "]: "
+                << hexString(cie.augmentationData) << "\n";
+
+            // Parse augmentation string, assigning meaning to the augmentationData.
+            size_t dataPos = 0;
+            for (size_t strPos = 1; strPos != cie.augmentationString.size(); ++strPos) {
+                switch (cie.augmentationString[strPos]) {
+                    case 'L':
+                        cie.lsdaEnc = cie.augmentationData[dataPos++];
+                        std::cout << "    .lsdaEnc: " << encStr(cie.lsdaEnc) << "\n";
+                        break;
+                    case 'P':
+                        cie.personalityEnc = cie.augmentationData[dataPos++];
+                        std::cout << "    .personalityEnc: " << encStr(cie.personalityEnc) << "\n";
+                        break;
+                    case 'R':
+                        cie.addressEnc = cie.augmentationData[dataPos++];
+                        std::cout << "    .addressEnc: " << encStr(cie.addressEnc) << "\n";
+                        break;
+                }
+            }
+        }
+
+        cie.instructions = std::string(ciePtr, cieEnd);
+        std::cout << "  .instructions[" << hexInt(cie.instructions.size()) << "]: "
+                << hexString(cie.instructions) << "\n";
+        ciePtr = cieEnd;
+
+        cieVec.push_back(std::move(cie));
+    }
+}
+
 
 class ElfScan {
 public:
@@ -266,112 +498,7 @@ public:
         return nullptr;
     }
 
-    void dumpEhFrame() {
-        auto secHeader = findSection(kSectionEhFrame);
-        if (!secHeader)
-            throw std::runtime_error("missing .eh_frame section");
-        size_t secSize = secHeader->sHeader.sh_size;
-        std::cout << "\"" << secHeader->name << "\"" << std::endl;
-        const char* sectionData = &image[secHeader->sHeader.sh_offset];
-        std::cout << "=====" << std::endl;
-
-        hexDump(std::cout, ".eh_frame section", sectionData, std::min(secSize, size_t{1} << 10)) << "\n";
-
-        // 1 or more CIE, read while `pos < secSize`.
-        size_t pos = 0;
-
-        // CFI:
-        //   Common Information Entry Record
-        //   Frame Description Entry Record(s)
-        struct Cie {
-            size_t length;
-            // [4] Length    Required
-            // [?8] Extended Length    Optional (if length==0xffffffff)
-            uint32_t cieId; // [4] CIE ID    Required
-            uint8_t version;
-            std::string augmentationString;
-
-            bool hasEhData;
-            uint64_t ehData;  // EH Data Optional (present if "eh" appears in augmentationString)
-
-            uint64_t codeAlign;  // Code Alignment Factor    Required LEB128
-            uint64_t dataAlign;  // Data Alignment Factor    Required LEB128
-            uint64_t returnRegister;  // Return Address Register    Required
-
-            // Augmentation Data Length    Optional
-            // Augmentation Data    Optional
-
-            // Initial Instructions    Required
-        };
-
-        while (pos < secSize) {
-            Cie cie{};
-
-            std::cout << "CFI record:\n";
-
-            {
-                uint32_t val;
-                memcpy(&val, sectionData + pos, sizeof(val));
-                pos += sizeof(val);
-                cie.length = val;
-            }
-
-            if (cie.length == 0) {
-                std::cout << "CIE length==0 terminator";
-            }
-
-            if (cie.length == 0xffff'ffff) {
-                uint64_t val;
-                memcpy(&val, sectionData + pos, sizeof(val));
-                pos += sizeof(val);
-                cie.length = val;
-            }
-
-            std::cout << "  .length: " << hexInt(cie.length) << "\n";
-
-            const char* cieBegin = sectionData + pos;
-            const char* cieEnd = cieBegin + cie.length;
-            pos += cie.length;
-            const char* ciePtr = cieBegin;
-
-            hexDump(std::cout, "  .data", cieBegin, cieEnd - cieBegin) << "\n";
-
-            {
-                uint32_t val;
-                memcpy(&val, ciePtr, sizeof(val));
-                ciePtr += sizeof(val);
-                cie.cieId = val;
-            }
-
-            if (cie.cieId != 0) {
-                std::cout << "  [skip non-CIE record with id " << hexInt(cie.cieId) << "]\n";
-                continue;
-            }
-
-            {
-                uint8_t val;
-                memcpy(&val, ciePtr, sizeof(val));
-                ciePtr += sizeof(val);
-                cie.version = val;
-            }
-
-            for (; *ciePtr; ++ciePtr)
-                cie.augmentationString.push_back(*ciePtr);
-
-            if (cie.hasEhData = (cie.augmentationString.find("eh") != std::string::npos)) {
-                uint64_t val;
-                memcpy(&val, ciePtr, sizeof(val));
-                ciePtr += sizeof(val);
-                cie.ehData = val;
-            }
-
-            std::cout << "  .version: " << hexInt(cie.version) << "\n";
-            std::cout << "  .augmentationString: \"" << cie.augmentationString << "\"\n";
-            if (cie.hasEhData) {
-                std::cout << "  .ehData: \"" << hexInt(cie.ehData) << "\"\n";
-            }
-        }
-    }
+    const std::string& data() const { return image; }
 
 private:
     std::string image;
@@ -387,7 +514,7 @@ int main(int argc, char** argv) {
     for (int i = 0; i < argc; ++i)
         args.push_back(argv[i]);
     if (args.size() < 1) {
-        std::cerr << "need filename" << std::endl;
+        std::cerr << "Need filename" << std::endl;
         return 1;
     }
 
@@ -399,7 +526,17 @@ int main(int argc, char** argv) {
     ElfScan elfScan(std::move(elfData));
     elfScan.load();
 
-    elfScan.dumpEhFrame();
+    std::cout << "=====" << std::endl;
+
+    {
+        auto secHeader = elfScan.findSection(kSectionEhFrame);
+        if (!secHeader)
+            throw std::runtime_error("missing .eh_frame section");
+        size_t secSize = secHeader->sHeader.sh_size;
+        std::cout << "\"" << secHeader->name << "\"" << std::endl;
+        const char* sectionData = &elfScan.data()[secHeader->sHeader.sh_offset];
+        scanCfe(sectionData, secSize);
+    }
 
     return 0;
 }
