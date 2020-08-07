@@ -3,6 +3,7 @@
 #define _GNU_SOURCE
 #endif
 
+#include <algorithm>
 #include <cstdint>
 #include <fstream>
 #include <iomanip>
@@ -164,6 +165,7 @@ int64_t decodeSLEB128(const char** data) {
 }
 
 uint64_t dwarfDecode(uint8_t encoding, const char* data, size_t& offset) {
+    size_t savedOffset = offset;
     uint64_t r = 0;
     // Low nybble determines numeric encoding
     switch (encoding & 0xf) {
@@ -231,6 +233,16 @@ uint64_t dwarfDecode(uint8_t encoding, const char* data, size_t& offset) {
             }
             break;
     }
+
+    // Apply:
+    switch (encoding & 0x70) {
+        case DW_EH_PE_pcrel:
+            std::cout << fmt::format("Apply pcrel: r:{:#x} + pc:{:#x} = {:#x}\n",
+                    r, savedOffset, r + savedOffset);
+            r += savedOffset;
+            break;
+    }
+
     return r;
 }
 
@@ -239,11 +251,11 @@ uint64_t dwarfDecode(uint8_t encoding, const char* data, size_t& offset) {
 //   Frame Description Entry Record(s)
 
 struct Cie {
+    bool hasEhData() const { return augmentationString.find("eh") != std::string::npos; }
+    bool hasAugmentation() const { return augmentationString.find('z') == 0; }
     size_t pos;  // starting offset within section
-
-    uint64_t length; // [4] Length    Required
-                     // [?8] Extended Length    present iff length == 0xffffffff
-    uint32_t cieId; // [4] CIE ID    Required
+    uint64_t length; // [4] Length, or [8] ExtendedLength iff length == 0xffffffff
+    uint32_t cieId; // [4] CIE ID == 0 (same position as the nonzero Fde ciePointer)
     uint8_t version;
     std::string augmentationString;
     uint64_t ehData;  // EH Data Optional (present if "eh" appears in augmentationString)
@@ -252,33 +264,96 @@ struct Cie {
     uint8_t returnRegister;  // Return Address Register ?   Required
     std::string augmentationData;  // format keyed by augmentationString
     std::string instructions;  // initial call frame dwarf instructions
-
     uint8_t lsdaEnc; // encoding for LSDA pointers in the FDEs
     uint8_t personalityEnc;  // Personality function's encoding.
     uint8_t addressEnc;  // encoding for addresses in the FDEs
-
     uint64_t personality;
-
-    bool hasEhData() const { return augmentationString.find("eh") != std::string::npos; }
-    bool hasAugmentation() const { return augmentationString.find('z') == 0; }
-
-    // Initial Instructions    Required
 };
 
 struct Fde {
+    size_t pos;  // starting offset within section
+    uint64_t length; // [4] Length    Required
+                     // [?8] Extended Length    present iff length == 0xffffffff
+    uint32_t ciePointer;
+
+    uint64_t pcBegin;
+    uint64_t pcRange;
 };
 
-void scanFde(const char *sectionData, size_t secSize) {
-}
+struct Cfe {
+    void scan(const char *sectionData, size_t secSize);
+    bool scanFde(const char *sectionData, size_t &pos);
 
-void scanCfe(const char *sectionData, size_t secSize) {
-    // hexDump(std::cout, ".eh_frame section", sectionData, std::min(secSize, size_t{1} << 10)) << "\n";
-
-    // 1 or more CIE, read while `pos < secSize`.
-    size_t pos = 0;
+    const Cie* cieLookup(uint64_t ciePos) {
+        auto iter = std::find_if(cieVec.begin(), cieVec.end(), [&](const Cie& e) {
+            return e.pos == ciePos;
+        });
+        if (iter == cieVec.end())
+            return nullptr;
+        return &*iter;
+    }
 
     std::vector<Cie> cieVec;
+    std::vector<Fde> fdeVec;
+};
 
+bool Cfe::scanFde(const char *sectionData, size_t &pos) {
+    Fde fde{};
+    fde.pos = pos;
+    std::cout << "  [FDE] pos:" << hexInt(fde.pos) << std::endl;
+    {
+        uint32_t val;
+        memcpy(&val, sectionData + pos, sizeof(val));
+        fde.length = val;
+        pos += sizeof(val);
+    }
+    if (fde.length == 0) {
+        std::cout << "[TERMINATOR, length==0]" << std::endl;
+        return false;
+    }
+    if (fde.length == 0xffff'ffff) {
+        uint64_t val;
+        memcpy(&val, sectionData + pos, sizeof(val));
+        fde.length = val;
+        pos += sizeof(val);
+    }
+    std::cout << fmt::format("  .length: {:#x}\n", fde.length);
+
+    size_t entryPos = pos;
+    pos += fde.length;
+
+    hexDump(std::cout, "FDE raw", sectionData + entryPos, fde.length) << "\n";
+
+    {
+        uint32_t val;
+        memcpy(&val, sectionData + entryPos, sizeof(val));
+        // the cie is val bytes relative to this pointer's location.
+        fde.ciePointer = entryPos - val;
+        std::cout << fmt::format("  .ciePointer: {:#x} [raw: {:#x}]\n", fde.ciePointer, val);
+        entryPos += sizeof(val);
+    }
+
+    const Cie* associatedCie = cieLookup(fde.ciePointer);
+    if (!associatedCie) {
+        throw std::runtime_error(
+                fmt::format("No associated CIE {:#x} for FDE {:#x}", fde.ciePointer, fde.pos));
+    }
+
+    size_t p0 = entryPos;
+    fde.pcBegin = dwarfDecode(associatedCie->addressEnc, sectionData, entryPos);
+    size_t p1 = entryPos;
+    std::cout << fmt::format("   .pcBegin: {:#x} [raw: {}]\n",
+                             fde.pcBegin, hexString(sectionData + p0, p1 - p0));
+    // fde.pcRange = 0;
+
+    fdeVec.push_back(std::move(fde));
+    return true;
+}
+
+void Cfe::scan(const char *sectionData, size_t secSize) {
+    // hexDump(std::cout, ".eh_frame section", sectionData, std::min(secSize, size_t{1} << 10)) << "\n";
+    // 1 or more CIE, read while `pos < secSize`.
+    size_t pos = 0;
     while (pos < secSize) {
         Cie cie{};
         cie.pos = pos;
@@ -310,7 +385,7 @@ void scanCfe(const char *sectionData, size_t secSize) {
         pos += cie.length;
         const char* ciePtr = cieBegin;
 
-        hexDump(std::cout, "  .data", cieBegin, cieEnd - cieBegin) << "\n";
+        // hexDump(std::cout, "  .data", cieBegin, cieEnd - cieBegin) << "\n";
 
         {
             uint32_t val;
@@ -320,8 +395,9 @@ void scanCfe(const char *sectionData, size_t secSize) {
         }
 
         if (cie.cieId != 0) {
-            std::cout << "  [FDE]\n";
-            // Handle FDE's.
+            // Start over, as this was an FDE all along.
+            if (!scanFde(sectionData, cie.pos))
+                break;
             continue;
         }
         std::cout << "  [CIE]\n";
@@ -334,7 +410,7 @@ void scanCfe(const char *sectionData, size_t secSize) {
         }
         std::cout << "  .version: " << hexInt(cie.version) << "\n";
 
-        std::cout << fmt::format("  .version: {:x}\n", cie.version);
+        std::cout << fmt::format("  .version: {:#x}\n", cie.version);
 
         for (; *ciePtr; ++ciePtr)
             cie.augmentationString.push_back(*ciePtr);
@@ -620,14 +696,19 @@ int main(int argc, char** argv) {
 
     std::cout << "=====" << std::endl;
 
+    Cfe cfe{};
+
     {
         auto secHeader = elfScan.findSection(kSectionEhFrame);
         if (!secHeader)
             throw std::runtime_error("missing .eh_frame section");
         size_t secSize = secHeader->sHeader.sh_size;
-        std::cout << "\"" << secHeader->name << "\"" << std::endl;
+        std::cout << fmt::format("\"{}\" at fOffset: {:#x}, Elf: {{ sh_offset: {:#x}, sh_addr: {:#x}}}\n",
+            secHeader->name, secHeader->fOffset,
+            secHeader->sHeader.sh_offset,
+            secHeader->sHeader.sh_addr);
         const char* sectionData = &elfScan.data()[secHeader->sHeader.sh_offset];
-        scanCfe(sectionData, secSize);
+        cfe.scan(sectionData, secSize);
     }
 
     return 0;
