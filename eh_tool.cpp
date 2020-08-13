@@ -116,6 +116,7 @@ std::string encStr(uint8_t encoding) {
         P_(DW_EH_PE_datarel)
         P_(DW_EH_PE_funcrel)
         P_(DW_EH_PE_aligned)
+        P_(0)
         default: part("[upper:?]"); break;
     }
     if (encoding & DW_EH_PE_indirect)
@@ -164,7 +165,74 @@ int64_t decodeSLEB128(const char** data) {
     return val;
 }
 
-uint64_t dwarfDecode(uint8_t encoding, const char* data, size_t& offset) {
+
+
+// CFI:
+//   Common Information Entry Record
+//   Frame Description Entry Record(s)
+
+struct Cie {
+    bool hasEhData() const { return augmentationString.find("eh") != std::string::npos; }
+    bool hasAugmentation() const { return augmentationString.find('z') == 0; }
+    size_t pos;  // starting offset within section
+    uint64_t length; // [4] Length, or [8] ExtendedLength iff length == 0xffffffff
+    uint32_t cieId; // [4] CIE ID == 0 (same position as the nonzero Fde ciePointer)
+    uint8_t version;
+    std::string augmentationString;
+    uint64_t ehData;  // EH Data Optional (present if "eh" appears in augmentationString)
+    uint64_t codeAlign;  // Code Alignment Factor Required ULEB128
+    int64_t dataAlign;   // Data Alignment Factor Required SLEB128
+    uint8_t returnRegister;  // Return Address Register ?   Required
+    std::string instructions;  // initial call frame dwarf instructions
+    uint8_t lsdaEnc = DW_EH_PE_omit; // encoding for LSDA pointers in the FDEs
+    uint8_t personalityEnc;  // Personality function's encoding.
+    uint8_t addressEnc;  // encoding for addresses in the FDEs
+    uint64_t personality;
+};
+
+struct Fde {
+    size_t pos;  // starting offset within section
+    uint64_t length; // [4] Length    Required
+                     // [?8] Extended Length    present iff length == 0xffffffff
+    uint32_t ciePointer;
+
+    uint64_t pcBegin;
+    uint64_t pcRange;
+    std::string augmentationData;
+    uint64_t lsdaAddr = 0;
+};
+
+struct Cfi {
+    void scan(const char *sectionData, size_t secSize);
+    bool scanFde(const char *sectionData, size_t &pos);
+
+    uint64_t dwarfDecode(uint8_t encoding, const char* data, size_t& offset);
+    uint64_t dwarfDecodeInner(uint8_t encoding, const char* data, size_t& offset);
+
+    const Cie* cieLookup(uint64_t ciePos) {
+        auto iter = std::find_if(cieVec.begin(), cieVec.end(), [&](const Cie& e) {
+            return e.pos == ciePos;
+        });
+        if (iter == cieVec.end())
+            return nullptr;
+        return &*iter;
+    }
+
+    void setSectionStart(uint64_t a) {
+        sectionStart = a;
+    }
+
+    void setSectionAddr(uint64_t a) {
+        sectionAddr = a;
+    }
+
+    uint64_t sectionStart = 0;
+    uint64_t sectionAddr = 0;
+    std::vector<Cie> cieVec;
+    std::vector<Fde> fdeVec;
+};
+
+uint64_t Cfi::dwarfDecodeInner(uint8_t encoding, const char* data, size_t& offset) {
     size_t savedOffset = offset;
     uint64_t r = 0;
     // Low nybble determines numeric encoding
@@ -237,67 +305,31 @@ uint64_t dwarfDecode(uint8_t encoding, const char* data, size_t& offset) {
     // Apply:
     switch (encoding & 0x70) {
         case DW_EH_PE_pcrel:
-            std::cout << fmt::format("Apply pcrel: r:{:#x} + pc:{:#x} = {:#x}\n",
-                    r, savedOffset, r + savedOffset);
+            auto rOrig = r;
             r += savedOffset;
+            r += sectionAddr;
+            std::cout << fmt::format(
+                    "   [apply pcrel: r:{:#x} + o:{:#x} + secAddr:{:#x} = {:#x}]\n",
+                    rOrig, savedOffset, sectionAddr, r);
             break;
     }
 
     return r;
 }
 
-// CFI:
-//   Common Information Entry Record
-//   Frame Description Entry Record(s)
-
-struct Cie {
-    bool hasEhData() const { return augmentationString.find("eh") != std::string::npos; }
-    bool hasAugmentation() const { return augmentationString.find('z') == 0; }
-    size_t pos;  // starting offset within section
-    uint64_t length; // [4] Length, or [8] ExtendedLength iff length == 0xffffffff
-    uint32_t cieId; // [4] CIE ID == 0 (same position as the nonzero Fde ciePointer)
-    uint8_t version;
-    std::string augmentationString;
-    uint64_t ehData;  // EH Data Optional (present if "eh" appears in augmentationString)
-    uint64_t codeAlign;  // Code Alignment Factor Required ULEB128
-    int64_t dataAlign;   // Data Alignment Factor Required SLEB128
-    uint8_t returnRegister;  // Return Address Register ?   Required
-    std::string augmentationData;  // format keyed by augmentationString
-    std::string instructions;  // initial call frame dwarf instructions
-    uint8_t lsdaEnc; // encoding for LSDA pointers in the FDEs
-    uint8_t personalityEnc;  // Personality function's encoding.
-    uint8_t addressEnc;  // encoding for addresses in the FDEs
-    uint64_t personality;
-};
-
-struct Fde {
-    size_t pos;  // starting offset within section
-    uint64_t length; // [4] Length    Required
-                     // [?8] Extended Length    present iff length == 0xffffffff
-    uint32_t ciePointer;
-
-    uint64_t pcBegin;
-    uint64_t pcRange;
-};
-
-struct Cfe {
-    void scan(const char *sectionData, size_t secSize);
-    bool scanFde(const char *sectionData, size_t &pos);
-
-    const Cie* cieLookup(uint64_t ciePos) {
-        auto iter = std::find_if(cieVec.begin(), cieVec.end(), [&](const Cie& e) {
-            return e.pos == ciePos;
-        });
-        if (iter == cieVec.end())
-            return nullptr;
-        return &*iter;
+uint64_t Cfi::dwarfDecode(uint8_t encoding, const char* data, size_t& offset) {
+    size_t p0 = offset;
+    auto r = dwarfDecodeInner(encoding, data, offset);
+    size_t p1 = offset;
+    if (1) {
+        std::cout << fmt::format("   [dwarfDecode: pos: {:#x}, raw: {}, enc: {}]\n",
+                p0, hexString(data + p0, p1 - p0), encStr(encoding));
     }
+    return r;
+}
 
-    std::vector<Cie> cieVec;
-    std::vector<Fde> fdeVec;
-};
 
-bool Cfe::scanFde(const char *sectionData, size_t &pos) {
+bool Cfi::scanFde(const char *sectionData, size_t &pos) {
     Fde fde{};
     fde.pos = pos;
     std::cout << "  [FDE] pos:" << hexInt(fde.pos) << std::endl;
@@ -339,18 +371,26 @@ bool Cfe::scanFde(const char *sectionData, size_t &pos) {
                 fmt::format("No associated CIE {:#x} for FDE {:#x}", fde.ciePointer, fde.pos));
     }
 
-    size_t p0 = entryPos;
     fde.pcBegin = dwarfDecode(associatedCie->addressEnc, sectionData, entryPos);
-    size_t p1 = entryPos;
-    std::cout << fmt::format("   .pcBegin: {:#x} [raw: {}]\n",
-                             fde.pcBegin, hexString(sectionData + p0, p1 - p0));
-    // fde.pcRange = 0;
+    std::cout << fmt::format("   .pcBegin: {:#x}\n", fde.pcBegin);
+    fde.pcRange = dwarfDecode(DW_EH_PE_udata4, sectionData, entryPos);
+    std::cout << fmt::format("   .pcRange: {:#x}\n", fde.pcRange);
+
+    if (associatedCie->hasAugmentation()) {
+        uint64_t n = dwarfDecode(DW_EH_PE_uleb128, sectionData, entryPos);
+        std::copy_n(sectionData + entryPos, n, std::back_inserter(fde.augmentationData));
+        std::cout << fmt::format("   .augmentationData[{}]: {}\n", n, hexString(fde.augmentationData));
+        if (associatedCie->lsdaEnc != DW_EH_PE_omit) {
+            fde.lsdaAddr = dwarfDecode(associatedCie->lsdaEnc, sectionData, entryPos);
+            std::cout << fmt::format("   .lsda: {}\n", n, hexInt(fde.lsdaAddr));
+        }
+    }
 
     fdeVec.push_back(std::move(fde));
     return true;
 }
 
-void Cfe::scan(const char *sectionData, size_t secSize) {
+void Cfi::scan(const char *sectionData, size_t secSize) {
     // hexDump(std::cout, ".eh_frame section", sectionData, std::min(secSize, size_t{1} << 10)) << "\n";
     // 1 or more CIE, read while `pos < secSize`.
     size_t pos = 0;
@@ -436,31 +476,32 @@ void Cfe::scan(const char *sectionData, size_t secSize) {
 
         if (cie.hasAugmentation()) {
             uint64_t len = decodeULEB128(&ciePtr);
-            cie.augmentationData.assign(ciePtr, len);
+            const char* augStart = ciePtr;
             ciePtr += len;
             // Contents' meaning determined by augmentationString
-            std::cout << "  .augmentation[" << hexInt(cie.augmentationData.size()) << "]: "
-                << hexString(cie.augmentationData) << "\n";
+            hexDump(std::cout, "  .augmentationData", augStart, len) << "\n";
 
-            // Parse augmentation string, assigning meaning to the augmentationData.
+            // Parse augmentationString, assigning meaning to the augmentationData.
             size_t dataPos = 0;
             for (size_t strPos = 1; strPos != cie.augmentationString.size(); ++strPos) {
                 switch (cie.augmentationString[strPos]) {
                     case 'L':
-                        cie.lsdaEnc = cie.augmentationData[dataPos++];
+                        cie.lsdaEnc = augStart[dataPos++];
                         std::cout << "    .lsdaEnc: " << encStr(cie.lsdaEnc) << "\n";
                         break;
                     case 'P':
                         // Encodes two things in data. An encoding spec for a pointer, then the pointer.
-                        cie.personalityEnc = cie.augmentationData[dataPos++];
+                        cie.personalityEnc = augStart[dataPos++];
                         std::cout << "    .personalityEnc: " << encStr(cie.personalityEnc) << "\n";
-                        cie.personality = dwarfDecode(cie.personalityEnc,
-                                                      cie.augmentationData.data(),
-                                                      dataPos);
+                        {
+                            size_t persPos = augStart - sectionData + dataPos;
+                            cie.personality = dwarfDecode(cie.personalityEnc, sectionData, persPos);
+                            dataPos = augStart - sectionData + persPos;
+                        }
                         std::cout << "    .personality: " << hexInt(cie.personality) << "\n";
                         break;
                     case 'R':
-                        cie.addressEnc = cie.augmentationData[dataPos++];
+                        cie.addressEnc = augStart[dataPos++];
                         std::cout << "    .addressEnc: " << encStr(cie.addressEnc) << "\n";
                         break;
                 }
@@ -696,7 +737,7 @@ int main(int argc, char** argv) {
 
     std::cout << "=====" << std::endl;
 
-    Cfe cfe{};
+    Cfi cfi{};
 
     {
         auto secHeader = elfScan.findSection(kSectionEhFrame);
@@ -708,7 +749,9 @@ int main(int argc, char** argv) {
             secHeader->sHeader.sh_offset,
             secHeader->sHeader.sh_addr);
         const char* sectionData = &elfScan.data()[secHeader->sHeader.sh_offset];
-        cfe.scan(sectionData, secSize);
+        cfi.setSectionStart(secHeader->sHeader.sh_offset);
+        cfi.setSectionAddr(secHeader->sHeader.sh_addr);
+        cfi.scan(sectionData, secSize);
     }
 
     return 0;
