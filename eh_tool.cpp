@@ -13,6 +13,7 @@
 #include <cstring>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <cassert>
 
@@ -28,8 +29,6 @@ namespace {
 #ifndef DW_EH_PE_indirect
 #define DW_EH_PE_indirect 0x80
 #endif
-
-bool kVerboseHeaders = false;
 
 const std::string kElfMagic = std::string(ELFMAG, SELFMAG);
 const std::string kSectionEhFrame = ".eh_frame";
@@ -165,6 +164,31 @@ int64_t decodeSLEB128(const char** data) {
     return val;
 }
 
+struct Elf {
+    struct ProgramHeader {
+        size_t fOffset;
+        Elf64_Phdr pHeader;
+    };
+
+    struct SectionHeader {
+        size_t fOffset;
+        std::string name;
+        Elf64_Shdr sHeader;
+    };
+
+    const SectionHeader* findSection(const std::string& name) const {
+        for (auto&& s : sHeaders)
+            if (s.name == name)
+                return &s;
+        return nullptr;
+    }
+
+    std::string_view image;
+    Elf64_Ehdr eHeader;
+    std::vector<ProgramHeader> pHeaders;
+    std::vector<SectionHeader> sHeaders;
+};
+
 
 
 // CFI:
@@ -174,6 +198,7 @@ int64_t decodeSLEB128(const char** data) {
 struct Cie {
     bool hasEhData() const { return augmentationString.find("eh") != std::string::npos; }
     bool hasAugmentation() const { return augmentationString.find('z') == 0; }
+
     size_t pos;  // starting offset within section
     uint64_t length; // [4] Length, or [8] ExtendedLength iff length == 0xffffffff
     uint32_t cieId; // [4] CIE ID == 0 (same position as the nonzero Fde ciePointer)
@@ -203,7 +228,7 @@ struct Fde {
 };
 
 struct Cfi {
-    void scan(const char *sectionData, size_t secSize);
+    void scan(const Elf& elf, const Elf::SectionHeader& secHeader);
     bool scanFde(const char *sectionData, size_t &pos);
 
     uint64_t dwarfDecode(uint8_t encoding, const char* data, size_t& offset);
@@ -390,7 +415,13 @@ bool Cfi::scanFde(const char *sectionData, size_t &pos) {
     return true;
 }
 
-void Cfi::scan(const char *sectionData, size_t secSize) {
+void Cfi::scan(const Elf& elf, const Elf::SectionHeader& secHeader) {
+    std::string_view secData = elf.image.substr(secHeader.sHeader.sh_offset,
+                                                secHeader.sHeader.sh_size);
+
+    const char *sectionData = secData.data();
+    size_t secSize = secData.size();
+
     // hexDump(std::cout, ".eh_frame section", sectionData, std::min(secSize, size_t{1} << 10)) << "\n";
     // 1 or more CIE, read while `pos < secSize`.
     size_t pos = 0;
@@ -494,7 +525,7 @@ void Cfi::scan(const char *sectionData, size_t secSize) {
                         cie.personalityEnc = augStart[dataPos++];
                         std::cout << "    .personalityEnc: " << encStr(cie.personalityEnc) << "\n";
                         {
-                            size_t persPos = augStart - sectionData + dataPos;
+                            size_t persPos = augStart + dataPos - sectionData;
                             cie.personality = dwarfDecode(cie.personalityEnc, sectionData, persPos);
                             dataPos = augStart - sectionData + persPos;
                         }
@@ -517,26 +548,14 @@ void Cfi::scan(const char *sectionData, size_t secSize) {
     }
 }
 
-
 class ElfScan {
 public:
-    struct ProgramHeader {
-        size_t fOffset;
-        Elf64_Phdr pHeader;
-    };
+    ElfScan() = default;
 
-    struct SectionHeader {
-        size_t fOffset;
-        std::string name;
-        Elf64_Shdr sHeader;
-    };
+    void scanElfHeader(Elf& elf) {
+        memcpy(&elf.eHeader, &elf.image[0], sizeof(elf.eHeader));
 
-    explicit ElfScan(std::string s) : image(std::move(s)) {}
-
-    void scanElfHeader() {
-        memcpy(&eHeader, &image[0], sizeof(eHeader));
-
-        const unsigned char* ident = eHeader.e_ident;
+        const unsigned char* ident = elf.eHeader.e_ident;
         std::string magic((const char*)ident, (size_t)SELFMAG);
         if (magic != kElfMagic) {
             std::cerr << "Expected " << hexString(kElfMagic) << ", got " << hexString(magic) << ".\n";
@@ -558,11 +577,11 @@ public:
         hexDump(std::cout, "    ei_abiversion", &ident[EI_ABIVERSION], 1) << "\n";
         std::cout << "  }\n";
 
-        if (kVerboseHeaders) {
+        if (verbose) {
             auto hdrDump = [](const char* field, auto x) {
                 std::cout << "  ." << field << ": " << hexInt(x) << "\n";
             };
-#define HDRF_(f) hdrDump(#f, eHeader.f);
+#define HDRF_(f) hdrDump(#f, elf.eHeader.f);
             HDRF_(e_type)             /* Object file type */
             HDRF_(e_machine)          /* Architecture */
             HDRF_(e_version)          /* Object file version */
@@ -580,23 +599,21 @@ public:
         }
     }
 
-    void scanProgramHeaders() {
-        size_t pho = eHeader.e_phoff;
-        pHeaders.reserve(eHeader.e_phnum);
-        for (size_t phi = 0; phi < eHeader.e_phnum; ++phi, pho += eHeader.e_phentsize) {
+    void scanProgramHeaders(Elf& elf) {
+        size_t pho = elf.eHeader.e_phoff;
+        elf.pHeaders.reserve(elf.eHeader.e_phnum);
+        for (size_t phi = 0; phi < elf.eHeader.e_phnum; ++phi, pho += elf.eHeader.e_phentsize) {
             Elf64_Phdr pHeader;
-            if (image.size() <= sizeof(pHeader)) {
-                std::cerr << "ELF image (" << image.size() << ") not big enough for pHeader ("
+            if (elf.image.size() <= sizeof(pHeader)) {
+                std::cerr << "ELF image (" << elf.image.size() << ") not big enough for pHeader ("
                     << sizeof(pHeader) << ")" << std::endl;
                 throw std::runtime_error("ELF too small");
             }
-            memcpy(&pHeader, image.data() + pho, sizeof(pHeader));
+            memcpy(&pHeader, elf.image.data() + pho, sizeof(pHeader));
 
-            if (kVerboseHeaders) {
-                std::cout << "Program segment header [" << phi << "], offset:" << hexInt(pho) << ": {\n";
-                auto hdrDump = [](const char* field, auto x) -> std::ostream& {
-                    return std::cout << "  ." << field << ": " << hexInt(x) << "\n";
-                };
+            if (verbose) {
+                fmt::print("Segment header #{}, hdrAt: {:#x}\n", phi, pho);
+                auto hdrDump = [](const char* field, auto x) { return fmt::print("  .{}: {:#x}\n", field, x); };
 #define HDRF_(f) hdrDump(#f, pHeader.f)
                 HDRF_(p_type);         /* Segment type */
                 HDRF_(p_flags);        /* Segment flags */
@@ -641,40 +658,37 @@ public:
                 }
                 std::cout << "}\n";
             }
-            pHeaders.push_back({pho, pHeader});
+            elf.pHeaders.push_back({pho, pHeader});
         }
     }
 
-    void scanSectionHeaders() {
-        size_t sho = eHeader.e_shoff;
-        sHeaders.reserve(eHeader.e_shnum);
-        for (size_t shi = 0; shi < eHeader.e_shnum; ++shi, sho += eHeader.e_shentsize) {
+    void scanSectionHeaders(Elf& elf) {
+        size_t sho = elf.eHeader.e_shoff;
+        elf.sHeaders.reserve(elf.eHeader.e_shnum);
+
+        for (size_t shi = 0; shi < elf.eHeader.e_shnum; ++shi, sho += elf.eHeader.e_shentsize) {
             Elf64_Shdr sHeader;
-            if (image.size() <= sizeof(sHeader)) {
-                std::cerr << "ELF image (" << image.size() << ") not big enough for sHeader ("
+            if (elf.image.size() <= sizeof(sHeader)) {
+                std::cerr << "ELF image (" << elf.image.size() << ") not big enough for sHeader ("
                     << sizeof(sHeader) << ")" << std::endl;
                 throw std::runtime_error("ELF too small");
             }
-            memcpy(&sHeader, image.data() + sho, sizeof(sHeader));
-            sHeaders.push_back({sho, {}, sHeader});
+            memcpy(&sHeader, elf.image.data() + sho, sizeof(sHeader));
+            elf.sHeaders.push_back({sho, {}, sHeader});
         }
 
         // Now go back and give them all names, now that we have seen the string table section.
-        const auto& strTabSec = sHeaders[eHeader.e_shstrndx].sHeader;
-        const char* strTab = &image[strTabSec.sh_offset];
-        for (auto&& s : sHeaders) {
+        const auto& strTabSec = elf.sHeaders[elf.eHeader.e_shstrndx].sHeader;
+        const char* strTab = &elf.image[strTabSec.sh_offset];
+        for (auto&& s : elf.sHeaders) {
             s.name = std::string(strTab + s.sHeader.sh_name);
         }
 
-        if (kVerboseHeaders) {
-            for (size_t shi = 0; shi != sHeaders.size(); ++shi) {
-                const auto& s = sHeaders[shi];
-                std::cout << "Section header [" << shi << "]"
-                    ", name: \"" << s.name << "\""
-                    ", offset:" << hexInt(s.fOffset) << ": {\n";
-                auto hdrDump = [](const char* field, auto x) -> std::ostream& {
-                    return std::cout << "  ." << field << ": " << hexInt(x) << "\n";
-                };
+        for (size_t shi = 0; shi != elf.sHeaders.size(); ++shi) {
+            auto& s = elf.sHeaders[shi];
+            fmt::print("Section header #{}, hdrAt: {:#x}, name: \"{}\"\n", shi, s.fOffset, s.name);
+            if (verbose) {
+                auto hdrDump = [](const char* field, auto x) { fmt::print("  .{}: {:#x}\n", field, x); };
 #define HDRF_(f) hdrDump(#f, s.sHeader.f)
                 HDRF_(sh_name);                /* Section name (string tbl index) */
                 HDRF_(sh_type);                /* Section type */
@@ -687,34 +701,72 @@ public:
                 HDRF_(sh_addralign);           /* Section alignment */
                 HDRF_(sh_entsize);             /* Entry size if section holds table */
 #undef HDRF_
-                std::cout << "}\n";
             }
         }
     }
 
-    void load() {
-        scanElfHeader();
+    Elf scan(std::string_view image) {
+        Elf elf{image};
+        scanElfHeader(elf);
         std::cout << std::endl;
-        scanProgramHeaders();
+        scanProgramHeaders(elf);
         std::cout << std::endl;
-        scanSectionHeaders();
+        scanSectionHeaders(elf);
+        return elf;
     }
 
-    const SectionHeader* findSection(const std::string& name) const {
-        for (auto&& s : sHeaders)
-            if (s.name == name)
-                return &s;
-        return nullptr;
-    }
-
-    const std::string& data() const { return image; }
-
-private:
-    std::string image;
-    Elf64_Ehdr eHeader;
-    std::vector<ProgramHeader> pHeaders;
-    std::vector<SectionHeader> sHeaders;
+    bool verbose = false;
 };
+
+int doMain(std::vector<std::string> args) {
+    bool verbose = false;
+
+    fmt::print("args[{}]\n", args.size());
+    for (auto& a : args) {
+        fmt::print("   \"{}\"\n", a);
+    }
+
+    std::string progName = args[0];
+    args.erase(args.begin());
+
+    if (auto iter = std::find(args.begin(), args.end(), "-v"); iter != args.end()) {
+        verbose = true;
+        args.erase(iter);
+
+        fmt::print("args[{}]\n", args.size());
+        for (auto& a : args) {
+            fmt::print("   \"{}\"\n", a);
+        }
+    }
+
+    if (args.empty()) {
+        fmt::print(stderr, "{}: Missing ELF file name\n", progName);
+        return 1;
+    }
+    std::string elfFile = args[0];
+    fmt::print("ELF file: {}\n", elfFile);
+    std::string elfImage = slurp(elfFile);
+    fmt::print("    size: {0} ({0:#x})\n", elfImage.size());
+
+    ElfScan scanner{};
+    scanner.verbose = verbose;
+    Elf elf = scanner.scan(elfImage);
+
+    auto secHeader = elf.findSection(kSectionEhFrame);
+    if (!secHeader)
+        throw std::runtime_error("missing .eh_frame section");
+
+    fmt::print("Section name: \"{}\", hdrAt: {:#x}, SectionHeader: {{ sh_offset: {:#x}, sh_addr: {:#x}}}\n",
+               secHeader->name,
+               secHeader->fOffset,
+               secHeader->sHeader.sh_offset,
+               secHeader->sHeader.sh_addr);
+
+    Cfi cfi{};
+    cfi.scan(elf, *secHeader);
+
+    return 0;
+}
 
 }  // namespace
 
@@ -722,37 +774,5 @@ int main(int argc, char** argv) {
     std::vector<std::string> args;
     for (int i = 0; i < argc; ++i)
         args.push_back(argv[i]);
-    if (args.size() < 1) {
-        std::cerr << "Need filename" << std::endl;
-        return 1;
-    }
-
-    std::cout << "ELF file: " << args[1] << "\n";
-    std::string elfData = slurp(args[1]);
-    std::cout << "size: " << elfData.size() << " (" << std::hex << std::showbase
-        << elfData.size() << std::noshowbase << std::dec << ")\n";
-
-    ElfScan elfScan(std::move(elfData));
-    elfScan.load();
-
-    std::cout << "=====" << std::endl;
-
-    Cfi cfi{};
-
-    {
-        auto secHeader = elfScan.findSection(kSectionEhFrame);
-        if (!secHeader)
-            throw std::runtime_error("missing .eh_frame section");
-        size_t secSize = secHeader->sHeader.sh_size;
-        std::cout << fmt::format("\"{}\" at fOffset: {:#x}, Elf: {{ sh_offset: {:#x}, sh_addr: {:#x}}}\n",
-            secHeader->name, secHeader->fOffset,
-            secHeader->sHeader.sh_offset,
-            secHeader->sHeader.sh_addr);
-        const char* sectionData = &elfScan.data()[secHeader->sHeader.sh_offset];
-        cfi.setSectionStart(secHeader->sHeader.sh_offset);
-        cfi.setSectionAddr(secHeader->sHeader.sh_addr);
-        cfi.scan(sectionData, secSize);
-    }
-
-    return 0;
+    return doMain(std::move(args));
 }
