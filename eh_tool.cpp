@@ -21,17 +21,30 @@
 #include <libdwarf/dwarf.h>
 
 #include <fmt/format.h>
+#include <fmt/ostream.h>
 
 namespace {
 
+using namespace fmt::literals;
+
 // gcc extension: 
 // https://code.woboq.org/llvm/compiler-rt/lib/builtins/gcc_personality_v0.c.html#_M/DW_EH_PE_indirect
-#ifndef DW_EH_PE_indirect
-#define DW_EH_PE_indirect 0x80
-#endif
+// https://git.savannah.nongnu.org/cgit/libunwind.git/tree/include/dwarf.h
+
+#define DW_EH_PE_FORMAT_MASK    0x0f    /* format of the encoded value */
+#define DW_EH_PE_APPL_MASK      0x70    /* how the value is to be applied */
+/* Flag bit.  If set, the resulting pointer is the address of the word
+ * that contains the final address.  */
+#define DW_EH_PE_indirect       0x80
+
 
 const std::string kElfMagic = std::string(ELFMAG, SELFMAG);
 const std::string kSectionEhFrame = ".eh_frame";
+const std::string kSectionText = ".text";
+const std::string kSectionGccExceptTable= ".gcc_except_table";
+
+bool verboseElfDecode = true;
+bool verboseDwarfDecode = true;
 
 std::string slurp(const std::string& fileName) {
     std::ifstream ifs(fileName, std::ios::binary);
@@ -43,30 +56,27 @@ std::string slurp(const std::string& fileName) {
 
 std::ostream& hexDump(std::ostream& os, const std::string& label, const void* p, size_t n) {
     auto cp = reinterpret_cast<const uint8_t*>(p);
-    os << std::hex << std::setfill('0');
-    const char* sep = "";
-    if (label.size())
-        os << label << ": ";
-    os << "[";
-
     bool multiLine = (n >= 16);
+    if (label.size())
+        fmt::print(os, "{}: ", label);
+    fmt::print(os, "[");
+    const char* kLineSep = "\n    ";
     if (multiLine)
-        os << "\n    ";
+        fmt::print(os, kLineSep);
+    const char* sep = "";
     int col = 0;
     for (; n--; ++cp) {
-        os << sep;
-        os << std::setw(2) << +*cp;
+        fmt::print(os, "{}{:#04x}", sep, +*cp);
         sep = " ";
         if (++col == 16) {
-            os << "\n    ";
+            fmt::print(os, kLineSep);
             col = 0;
             sep = "";
         }
     }
-    os << std::dec;
     if (multiLine)
-        os << "\n";
-    os << "]";
+        fmt::print(os, "\n  ");
+    fmt::print(os, "]");
     return os;
 }
 
@@ -76,7 +86,7 @@ std::string hexString(const void* p, size_t n) {
     return oss.str();
 }
 
-std::string hexString(const std::string& s) {
+std::string hexString(std::string_view s) {
     return hexString(s.data(), s.size());
 }
 
@@ -109,7 +119,7 @@ std::string encStr(uint8_t encoding) {
         default: part("[lower:?]"); break;
     }
     // upper nybble: application
-    switch (encoding & 0x70) {
+    switch (encoding & DW_EH_PE_FORMAT_MASK) {
         P_(DW_EH_PE_pcrel)
         P_(DW_EH_PE_textrel)
         P_(DW_EH_PE_datarel)
@@ -133,8 +143,8 @@ std::string encStr(uint8_t encoding) {
     return result;
 }
 
-uint64_t decodeULEB128(const char** data) {
-    const char*& in = *data;
+uint64_t decodeULEB128(std::string_view& data) {
+    const char* in = data.data();
     uint64_t val = 0;
     int shift = 0;
     uint64_t c;
@@ -146,11 +156,12 @@ uint64_t decodeULEB128(const char** data) {
             break;
         shift += 7;
     } while (c & 0x80);
+    data.remove_prefix(in - data.data());
     return val;
 }
 
-int64_t decodeSLEB128(const char** data) {
-    const char*& in = *data;
+int64_t decodeSLEB128(std::string_view& data) {
+    const char* in = data.data();
     int64_t val = 0;
     int64_t shift = 0;
     int64_t c;
@@ -161,22 +172,23 @@ int64_t decodeSLEB128(const char** data) {
     } while (c & 0x80);
     if (c & 0x40)
         val |= static_cast<int64_t>((~uint64_t{0}) << shift);
+    data.remove_prefix(in - data.data());
     return val;
 }
 
 struct Elf {
     struct ProgramHeader {
-        size_t fOffset;
+        size_t hdrAt;
         Elf64_Phdr pHeader;
     };
 
     struct SectionHeader {
-        size_t fOffset;
+        size_t hdrAt;
         std::string name;
         Elf64_Shdr sHeader;
     };
 
-    const SectionHeader* findSection(const std::string& name) const {
+    const SectionHeader* findSection(std::string_view name) const {
         for (auto&& s : sHeaders)
             if (s.name == name)
                 return &s;
@@ -190,17 +202,15 @@ struct Elf {
 };
 
 
-
 // CFI:
-//   Common Information Entry Record
-//   Frame Description Entry Record(s)
+//   - Common Information Entry Record
+//   - Frame Description Entry Record(s)
 
 struct Cie {
     bool hasEhData() const { return augmentationString.find("eh") != std::string::npos; }
     bool hasAugmentation() const { return augmentationString.find('z') == 0; }
 
     size_t pos;  // starting offset within section
-    uint64_t length; // [4] Length, or [8] ExtendedLength iff length == 0xffffffff
     uint32_t cieId; // [4] CIE ID == 0 (same position as the nonzero Fde ciePointer)
     uint8_t version;
     std::string augmentationString;
@@ -228,11 +238,13 @@ struct Fde {
 };
 
 struct Cfi {
-    void scan(const Elf& elf, const Elf::SectionHeader& secHeader);
-    bool scanFde(const char *sectionData, size_t &pos);
+public:
+    Cfi(const Elf* elf, const Elf::SectionHeader* sec) : elf(elf), sec(sec) {}
 
-    uint64_t dwarfDecode(uint8_t encoding, const char* data, size_t& offset);
-    uint64_t dwarfDecodeInner(uint8_t encoding, const char* data, size_t& offset);
+    void scan();
+
+    uint8_t readByte(std::string_view& data);
+    uint64_t decodeDwarf(uint8_t encoding, std::string_view& data);
 
     const Cie* cieLookup(uint64_t ciePos) {
         auto iter = std::find_if(cieVec.begin(), cieVec.end(), [&](const Cie& e) {
@@ -243,152 +255,169 @@ struct Cfi {
         return &*iter;
     }
 
-    void setSectionStart(uint64_t a) {
-        sectionStart = a;
+private:
+    bool scanCie(std::string_view data, uint32_t startPosition);
+    bool scanFde(std::string_view data, uint32_t startPosition, uint32_t cieId);
+
+    std::string_view elfImage() const {
+        return elf->image;
     }
 
-    void setSectionAddr(uint64_t a) {
-        sectionAddr = a;
+    std::string_view secData() const {
+        return elfImage().substr(sec->sHeader.sh_offset, sec->sHeader.sh_size);
     }
 
-    uint64_t sectionStart = 0;
-    uint64_t sectionAddr = 0;
+    uint64_t decodeDwarfInner(uint8_t encoding, std::string_view& data);
+
+public:
+    const Elf* elf;
+    const Elf::SectionHeader* sec;
     std::vector<Cie> cieVec;
     std::vector<Fde> fdeVec;
 };
 
-uint64_t Cfi::dwarfDecodeInner(uint8_t encoding, const char* data, size_t& offset) {
-    size_t savedOffset = offset;
+
+template <typename T>
+T readInteger(std::string_view& data) {
+    T t;
+    std::copy_n(data.begin(), sizeof(t), reinterpret_cast<char*>(&t));
+    data.remove_prefix(sizeof(t));
+    return t;
+}
+
+uint64_t Cfi::decodeDwarfInner(uint8_t encoding, std::string_view& data /* inout */) {
+    std::string_view save = data;
     uint64_t r = 0;
     // Low nybble determines numeric encoding
-    switch (encoding & 0xf) {
+    switch (encoding & DW_EH_PE_FORMAT_MASK) {
         case DW_EH_PE_uleb128:
-            {
-                const char* dataTmp = data + offset;
-                r = static_cast<uint64_t>(decodeULEB128(&dataTmp));
-                offset = dataTmp - data;
-            }
+            r = decodeULEB128(data);
             break;
         case DW_EH_PE_udata2:
-            {
-                uint16_t t;
-                memcpy(&t, data + offset, sizeof(t));
-                offset += sizeof(t);
-                r = t;
-            }
+            r = readInteger<uint16_t>(data);
             break;
         case DW_EH_PE_udata4:
-            {
-                uint32_t t;
-                memcpy(&t, data + offset, sizeof(t));
-                offset += sizeof(t);
-                r = t;
-            }
+            r = readInteger<uint32_t>(data);
             break;
         case DW_EH_PE_udata8:
         case DW_EH_PE_absptr:
-            {
-                uint64_t t;
-                memcpy(&t, data + offset, sizeof(t));
-                offset += sizeof(t);
-                r = t;
-            }
+            r = readInteger<uint64_t>(data);
             break;
         case DW_EH_PE_sleb128:
-            {
-                const char* dataTmp = data + offset;
-                r = static_cast<uint64_t>(decodeSLEB128(&dataTmp));
-                offset = dataTmp - data;
-            }
+            r = static_cast<uint64_t>(decodeSLEB128(data));
             break;
         case DW_EH_PE_sdata2:
-            {
-                int16_t t;
-                memcpy(&t, data + offset, 2);
-                offset += 2;
-                r = static_cast<uint64_t>(static_cast<int64_t>(t));
-            }
+            r = static_cast<uint64_t>(readInteger<int16_t>(data));
             break;
         case DW_EH_PE_sdata4:
-            {
-                int32_t t;
-                memcpy(&t, data + offset, 4);
-                offset += 4;
-                r = static_cast<uint64_t>(static_cast<int64_t>(t));
-            }
+            r = static_cast<uint64_t>(readInteger<int32_t>(data));
             break;
         case DW_EH_PE_sdata8:
-            {
-                int64_t t;
-                memcpy(&t, data + offset, 8);
-                offset += 8;
-                r = static_cast<uint64_t>(static_cast<int64_t>(t));
-            }
+            r = static_cast<uint64_t>(readInteger<int64_t>(data));
             break;
     }
 
-    // Apply:
-    switch (encoding & 0x70) {
+    // High nybble specifies contextual adjustments applied to the numeric value:
+    switch (encoding & DW_EH_PE_APPL_MASK) {
         case DW_EH_PE_pcrel:
-            auto rOrig = r;
-            r += savedOffset;
-            r += sectionAddr;
+            auto raw = r;
+            r = sec->sHeader.sh_addr + raw + (save.data() - secData().data());
             std::cout << fmt::format(
-                    "   [apply pcrel: r:{:#x} + o:{:#x} + secAddr:{:#x} = {:#x}]\n",
-                    rOrig, savedOffset, sectionAddr, r);
+                    "   [apply pcrel: mem:{:#x} + raw:{:#x} + offset:{:#x} = {:#x}]\n",
+                    sec->sHeader.sh_addr,
+                    raw,
+                    save.data() - secData().data(),
+                    r);
             break;
     }
 
     return r;
 }
 
-uint64_t Cfi::dwarfDecode(uint8_t encoding, const char* data, size_t& offset) {
-    size_t p0 = offset;
-    auto r = dwarfDecodeInner(encoding, data, offset);
-    size_t p1 = offset;
-    if (1) {
-        std::cout << fmt::format("   [dwarfDecode: pos: {:#x}, raw: {}, enc: {}]\n",
-                p0, hexString(data + p0, p1 - p0), encStr(encoding));
+uint8_t Cfi::readByte(std::string_view& data) {
+    uint8_t r = data.at(0);
+    data.remove_prefix(1);
+    fmt::print("   [readByte at {:#10x}: {:#04x}]\n", data.data() - elfImage().data(), +r);
+    return r;
+}
+
+uint64_t Cfi::decodeDwarf(uint8_t encoding, std::string_view& data) {
+    std::string_view save = data;
+    uint64_t pos = save.data() - elfImage().data();
+    auto r = decodeDwarfInner(encoding, data);
+    if (verboseDwarfDecode) {
+        std::string_view consumed(save.data(), data.data() - save.data());
+        fmt::print("   [decodeDwarf: pos: {:#x}, raw: {}, enc: {}]\n",
+                   pos, hexString(consumed), encStr(encoding));
     }
     return r;
 }
 
+bool Cfi::scanCie(std::string_view data, uint32_t startPosition) {
+    fmt::print("[CIE]\n");
+    Cie cie{};
+    cie.pos = startPosition;
+    cie.version = readByte(data);
+    fmt::print("  .version: {:#4x}\n", cie.version);
+    while (!data.empty()) {
+        char c = data.front();
+        data.remove_prefix(1);
+        if (!c)
+            break;
+        cie.augmentationString.push_back(c);
+    }
+    fmt::print("  .augmentationString: \"{}\"\n", cie.augmentationString);
+    if (cie.hasEhData()) {
+        cie.ehData = decodeDwarf(DW_EH_PE_udata4, data);
+        fmt::print("  .ehData: {:#10x}\n", cie.ehData);
+    }
+    cie.codeAlign = decodeDwarf(DW_EH_PE_uleb128, data);
+    fmt::print("  .codeAlign: {}\n", cie.codeAlign);
+    cie.dataAlign = decodeDwarf(DW_EH_PE_sleb128, data);
+    fmt::print("  .dataAlign: {}\n", cie.dataAlign);
+    cie.returnRegister = readByte(data);
+    fmt::print("  .returnRegister: {}\n", cie.returnRegister);
+    if (cie.hasAugmentation()) {
+        uint64_t len = decodeDwarf(DW_EH_PE_uleb128, data);
+        std::string_view aug = data.substr(0, len);
+        data.remove_prefix(len);
+        // Contents' meaning determined by augmentationString
+        hexDump(std::cout, "  .augmentationData", aug.data(), aug.size()) << "\n";
+        // Parse augmentationString, assigning meaning to the augmentationData.
+        for (size_t strPos = 1; strPos != cie.augmentationString.size(); ++strPos) {
+            switch (cie.augmentationString[strPos]) {
+                case 'L':
+                    cie.lsdaEnc = readByte(aug);
+                    fmt::print("    .lsdaEnc: {}\n", encStr(cie.lsdaEnc));
+                    break;
+                case 'P':
+                    // Encodes encoding spec for a pointer, then the pointer.
+                    cie.personalityEnc = readByte(aug);
+                    fmt::print("    .personalityEnc: {}\n", encStr(cie.personalityEnc));
+                    cie.personality = decodeDwarf(cie.personalityEnc, aug);
+                    fmt::print("    .personality: {:1}{:#10x}\n",
+                               (cie.personalityEnc & DW_EH_PE_indirect) ? "*" : "", cie.personality);
+                    break;
+                case 'R':
+                    cie.addressEnc = readByte(aug);
+                    fmt::print("    .addressEnc: {}\n", encStr(cie.addressEnc));
+                    break;
+            }
+        }
+    }
+    cie.instructions = data;
+    fmt::print("  .instructions: {}\n", hexString(cie.instructions));
+    cieVec.push_back(std::move(cie));
+    return true;
+}
 
-bool Cfi::scanFde(const char *sectionData, size_t &pos) {
+bool Cfi::scanFde(std::string_view data, uint32_t startPosition, uint32_t cieId) {
     Fde fde{};
-    fde.pos = pos;
-    std::cout << "  [FDE] pos:" << hexInt(fde.pos) << std::endl;
-    {
-        uint32_t val;
-        memcpy(&val, sectionData + pos, sizeof(val));
-        fde.length = val;
-        pos += sizeof(val);
-    }
-    if (fde.length == 0) {
-        std::cout << "[TERMINATOR, length==0]" << std::endl;
-        return false;
-    }
-    if (fde.length == 0xffff'ffff) {
-        uint64_t val;
-        memcpy(&val, sectionData + pos, sizeof(val));
-        fde.length = val;
-        pos += sizeof(val);
-    }
-    std::cout << fmt::format("  .length: {:#x}\n", fde.length);
+    fde.pos = startPosition;
 
-    size_t entryPos = pos;
-    pos += fde.length;
-
-    hexDump(std::cout, "FDE raw", sectionData + entryPos, fde.length) << "\n";
-
-    {
-        uint32_t val;
-        memcpy(&val, sectionData + entryPos, sizeof(val));
-        // the cie is val bytes relative to this pointer's location.
-        fde.ciePointer = entryPos - val;
-        std::cout << fmt::format("  .ciePointer: {:#x} [raw: {:#x}]\n", fde.ciePointer, val);
-        entryPos += sizeof(val);
-    }
+    fde.pos = data.data() - secData().data();
+    fde.ciePointer = data.data() - secData().data() - cieId - sizeof(cieId);
+    fmt::print("[FDE] .ciePointer: {:#04x}\n", fde.ciePointer);
 
     const Cie* associatedCie = cieLookup(fde.ciePointer);
     if (!associatedCie) {
@@ -396,162 +425,65 @@ bool Cfi::scanFde(const char *sectionData, size_t &pos) {
                 fmt::format("No associated CIE {:#x} for FDE {:#x}", fde.ciePointer, fde.pos));
     }
 
-    fde.pcBegin = dwarfDecode(associatedCie->addressEnc, sectionData, entryPos);
+    fde.pcBegin = decodeDwarf(associatedCie->addressEnc, data);
     std::cout << fmt::format("   .pcBegin: {:#x}\n", fde.pcBegin);
-    fde.pcRange = dwarfDecode(DW_EH_PE_udata4, sectionData, entryPos);
+
+    // Same format as pcBegin, but only uses an absolute apply rule. (libunwind:src/dwarf/Gfde.c)
+    fde.pcRange = decodeDwarf(associatedCie->addressEnc & DW_EH_PE_FORMAT_MASK, data);
     std::cout << fmt::format("   .pcRange: {:#x}\n", fde.pcRange);
 
+#if 0
     if (associatedCie->hasAugmentation()) {
-        uint64_t n = dwarfDecode(DW_EH_PE_uleb128, sectionData, entryPos);
-        std::copy_n(sectionData + entryPos, n, std::back_inserter(fde.augmentationData));
+        uint64_t n = decodeDwarf(DW_EH_PE_uleb128, sectionData.data(), entryPos);
+        std::copy_n(sectionData.data() + entryPos, n, std::back_inserter(fde.augmentationData));
         std::cout << fmt::format("   .augmentationData[{}]: {}\n", n, hexString(fde.augmentationData));
         if (associatedCie->lsdaEnc != DW_EH_PE_omit) {
-            fde.lsdaAddr = dwarfDecode(associatedCie->lsdaEnc, sectionData, entryPos);
+            fde.lsdaAddr = decodeDwarf(associatedCie->lsdaEnc, sectionData.data(), entryPos);
             std::cout << fmt::format("   .lsda: {}\n", n, hexInt(fde.lsdaAddr));
         }
     }
+#endif
 
     fdeVec.push_back(std::move(fde));
     return true;
 }
 
-void Cfi::scan(const Elf& elf, const Elf::SectionHeader& secHeader) {
-    std::string_view secData = elf.image.substr(secHeader.sHeader.sh_offset,
-                                                secHeader.sHeader.sh_size);
-
-    const char *sectionData = secData.data();
-    size_t secSize = secData.size();
-
-    // hexDump(std::cout, ".eh_frame section", sectionData, std::min(secSize, size_t{1} << 10)) << "\n";
-    // 1 or more CIE, read while `pos < secSize`.
-    size_t pos = 0;
-    while (pos < secSize) {
-        Cie cie{};
-        cie.pos = pos;
-        std::cout << "\n";
-        std::cout << "[CFI] pos: " << hexInt(pos) << std::endl;
-        {
-            uint32_t val;
-            memcpy(&val, sectionData + pos, sizeof(val));
-            pos += sizeof(val);
-            cie.length = val;
-        }
-
-        if (cie.length == 0) {
-            std::cout << "[TERMINATOR, length==0]" << std::endl;
-            break;
-        }
-
-        if (cie.length == 0xffff'ffff) {
-            uint64_t val;
-            memcpy(&val, sectionData + pos, sizeof(val));
-            pos += sizeof(val);
-            cie.length = val;
-        }
-
-        // std::cout << "  .length: " << hexInt(cie.length) << "\n";
-
-        const char* cieBegin = sectionData + pos;
-        const char* cieEnd = cieBegin + cie.length;
-        pos += cie.length;
-        const char* ciePtr = cieBegin;
-
-        // hexDump(std::cout, "  .data", cieBegin, cieEnd - cieBegin) << "\n";
-
-        {
-            uint32_t val;
-            memcpy(&val, ciePtr, sizeof(val));
-            ciePtr += sizeof(val);
-            cie.cieId = val;
-        }
-
-        if (cie.cieId != 0) {
-            // Start over, as this was an FDE all along.
-            if (!scanFde(sectionData, cie.pos))
+void Cfi::scan() {
+    std::string_view unparsed = secData();
+    while (!unparsed.empty()) {
+        uint32_t startPosition = unparsed.data() - secData().data();  // section relative
+        fmt::print("\n[CFI] entry at {:#10x} (.eh_frame + {:#x})\n",
+                unparsed.data() - elfImage().data(), startPosition);
+        uint64_t length = decodeDwarf(DW_EH_PE_udata4, unparsed);
+        switch (length) {
+            case 0:
+                fmt::print("[TERMINATOR, length==0]\n");
+                return;
+            case 0xffff'ffff:
+                // Replace Length with ExtendedLength.
+                length = decodeDwarf(DW_EH_PE_udata8, unparsed);
                 break;
-            continue;
         }
-        std::cout << "  [CIE]\n";
+        std::string_view cieData = unparsed.substr(0, length);
+        unparsed = unparsed.substr(length);
+        fmt::print("  .data[{:#x}]: {}\n", cieData.size(), hexString(cieData));
+        uint32_t cieId = decodeDwarf(DW_EH_PE_udata4, cieData);
+        fmt::print("  cieId: {:#x}\n", cieId);
 
-        {
-            uint8_t val;
-            memcpy(&val, ciePtr, sizeof(val));
-            ciePtr += sizeof(val);
-            cie.version = val;
+        if (cieId == 0) {
+            // Continue as a CIE
+            if (!scanCie(cieData, startPosition))
+                return;
+        } else {
+            // Continue as an FDE
+            if (!scanFde(cieData, startPosition, cieId))
+                return;
         }
-        std::cout << "  .version: " << hexInt(cie.version) << "\n";
-
-        std::cout << fmt::format("  .version: {:#x}\n", cie.version);
-
-        for (; *ciePtr; ++ciePtr)
-            cie.augmentationString.push_back(*ciePtr);
-        ++ciePtr;  // nul
-        std::cout << "  .augmentationString: \"" << cie.augmentationString << "\"\n";
-
-        if (cie.hasEhData()) {
-            uint64_t val;
-            memcpy(&val, ciePtr, sizeof(val));
-            ciePtr += sizeof(val);
-            cie.ehData = val;
-            std::cout << "  .ehData: \"" << hexInt(cie.ehData) << "\"\n";
-        }
-
-        cie.codeAlign = decodeULEB128(&ciePtr);
-        std::cout << "  .codeAlign: " << cie.codeAlign << "\n";
-
-        cie.dataAlign = decodeSLEB128(&ciePtr);
-        std::cout << "  .dataAlign: " << cie.dataAlign << "\n";
-
-        cie.returnRegister = *ciePtr++;
-        std::cout << "  .returnRegister: " << hexInt(cie.returnRegister) << "\n";
-
-        if (cie.hasAugmentation()) {
-            uint64_t len = decodeULEB128(&ciePtr);
-            const char* augStart = ciePtr;
-            ciePtr += len;
-            // Contents' meaning determined by augmentationString
-            hexDump(std::cout, "  .augmentationData", augStart, len) << "\n";
-
-            // Parse augmentationString, assigning meaning to the augmentationData.
-            size_t dataPos = 0;
-            for (size_t strPos = 1; strPos != cie.augmentationString.size(); ++strPos) {
-                switch (cie.augmentationString[strPos]) {
-                    case 'L':
-                        cie.lsdaEnc = augStart[dataPos++];
-                        std::cout << "    .lsdaEnc: " << encStr(cie.lsdaEnc) << "\n";
-                        break;
-                    case 'P':
-                        // Encodes two things in data. An encoding spec for a pointer, then the pointer.
-                        cie.personalityEnc = augStart[dataPos++];
-                        std::cout << "    .personalityEnc: " << encStr(cie.personalityEnc) << "\n";
-                        {
-                            size_t persPos = augStart + dataPos - sectionData;
-                            cie.personality = dwarfDecode(cie.personalityEnc, sectionData, persPos);
-                            dataPos = augStart - sectionData + persPos;
-                        }
-                        std::cout << "    .personality: " << hexInt(cie.personality) << "\n";
-                        break;
-                    case 'R':
-                        cie.addressEnc = augStart[dataPos++];
-                        std::cout << "    .addressEnc: " << encStr(cie.addressEnc) << "\n";
-                        break;
-                }
-            }
-        }
-
-        cie.instructions = std::string(ciePtr, cieEnd);
-        std::cout << "  .instructions[" << hexInt(cie.instructions.size()) << "]: "
-                << hexString(cie.instructions) << "\n";
-        ciePtr = cieEnd;
-
-        cieVec.push_back(std::move(cie));
     }
 }
 
-class ElfScan {
+class ElfScanner {
 public:
-    ElfScan() = default;
-
     void scanElfHeader(Elf& elf) {
         memcpy(&elf.eHeader, &elf.image[0], sizeof(elf.eHeader));
 
@@ -577,7 +509,7 @@ public:
         hexDump(std::cout, "    ei_abiversion", &ident[EI_ABIVERSION], 1) << "\n";
         std::cout << "  }\n";
 
-        if (verbose) {
+        if (verboseElfDecode) {
             auto hdrDump = [](const char* field, auto x) {
                 std::cout << "  ." << field << ": " << hexInt(x) << "\n";
             };
@@ -611,7 +543,7 @@ public:
             }
             memcpy(&pHeader, elf.image.data() + pho, sizeof(pHeader));
 
-            if (verbose) {
+            if (verboseElfDecode) {
                 fmt::print("Segment header #{}, hdrAt: {:#x}\n", phi, pho);
                 auto hdrDump = [](const char* field, auto x) { return fmt::print("  .{}: {:#x}\n", field, x); };
 #define HDRF_(f) hdrDump(#f, pHeader.f)
@@ -686,8 +618,8 @@ public:
 
         for (size_t shi = 0; shi != elf.sHeaders.size(); ++shi) {
             auto& s = elf.sHeaders[shi];
-            fmt::print("Section header #{}, hdrAt: {:#x}, name: \"{}\"\n", shi, s.fOffset, s.name);
-            if (verbose) {
+            fmt::print("Section header #{}, hdrAt: {:#x}, name: \"{}\"\n", shi, s.hdrAt, s.name);
+            if (verboseElfDecode) {
                 auto hdrDump = [](const char* field, auto x) { fmt::print("  .{}: {:#x}\n", field, x); };
 #define HDRF_(f) hdrDump(#f, s.sHeader.f)
                 HDRF_(sh_name);                /* Section name (string tbl index) */
@@ -714,12 +646,10 @@ public:
         scanSectionHeaders(elf);
         return elf;
     }
-
-    bool verbose = false;
 };
 
-int doMain(std::vector<std::string> args) {
-    bool verbose = false;
+int mainInner(std::vector<std::string> args) {
+    bool verboseOpt = false;
 
     fmt::print("args[{}]\n", args.size());
     for (auto& a : args) {
@@ -730,7 +660,7 @@ int doMain(std::vector<std::string> args) {
     args.erase(args.begin());
 
     if (auto iter = std::find(args.begin(), args.end(), "-v"); iter != args.end()) {
-        verbose = true;
+        verboseOpt = true;
         args.erase(iter);
 
         fmt::print("args[{}]\n", args.size());
@@ -748,23 +678,32 @@ int doMain(std::vector<std::string> args) {
     std::string elfImage = slurp(elfFile);
     fmt::print("    size: {0} ({0:#x})\n", elfImage.size());
 
-    ElfScan scanner{};
-    scanner.verbose = verbose;
+    ElfScanner scanner{};
+
+    verboseElfDecode = verboseOpt;
+    verboseDwarfDecode = verboseOpt;
+
     Elf elf = scanner.scan(elfImage);
 
-    auto secHeader = elf.findSection(kSectionEhFrame);
-    if (!secHeader)
-        throw std::runtime_error("missing .eh_frame section");
+    auto dumpSection = [&](std::string_view name) {
+        auto h = elf.findSection(name);
+        if (!h)
+            throw std::runtime_error(fmt::format("missing \'{}\' section", name));
+        fmt::print("Section name: {:18}, sh_offset: {:#10x}, sh_addr: {:#10x}, sh_size: {:#10x}\n",
+                   h->name,
+                   h->sHeader.sh_offset,
+                   h->sHeader.sh_addr,
+                   h->sHeader.sh_size);
+    };
+    dumpSection(kSectionText);
+    dumpSection(kSectionGccExceptTable);
+    dumpSection(kSectionEhFrame);
 
-    fmt::print("Section name: \"{}\", hdrAt: {:#x}, SectionHeader: {{ sh_offset: {:#x}, sh_addr: {:#x}}}\n",
-               secHeader->name,
-               secHeader->fOffset,
-               secHeader->sHeader.sh_offset,
-               secHeader->sHeader.sh_addr);
-
-    Cfi cfi{};
-    cfi.scan(elf, *secHeader);
-
+    auto ehh = elf.findSection(kSectionEhFrame);
+    if (!ehh)
+        throw std::runtime_error(fmt::format("missing `{}` section", kSectionEhFrame));
+    Cfi cfi(&elf, ehh);
+    cfi.scan();
     return 0;
 }
 
@@ -774,5 +713,5 @@ int main(int argc, char** argv) {
     std::vector<std::string> args;
     for (int i = 0; i < argc; ++i)
         args.push_back(argv[i]);
-    return doMain(std::move(args));
+    return mainInner(std::move(args));
 }

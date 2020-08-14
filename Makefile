@@ -10,4 +10,4 @@ eh_tool: eh_tool.o
 	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
 
 test: eh_tool
-	./eh_tool ../mongod
+	./eh_tool -v ../mongod
