@@ -106,7 +106,7 @@ std::string encStr(uint8_t encoding) {
 
 #define P_(x) case x: part(#x); break;
     // lower nybble: value format
-    switch (encoding & 0x0f) {
+    switch (encoding & DW_EH_PE_FORMAT_MASK) {
         P_(DW_EH_PE_absptr)
         P_(DW_EH_PE_uleb128)
         P_(DW_EH_PE_udata2)
@@ -119,7 +119,7 @@ std::string encStr(uint8_t encoding) {
         default: part("[lower:?]"); break;
     }
     // upper nybble: application
-    switch (encoding & DW_EH_PE_FORMAT_MASK) {
+    switch (encoding & DW_EH_PE_APPL_MASK) {
         P_(DW_EH_PE_pcrel)
         P_(DW_EH_PE_textrel)
         P_(DW_EH_PE_datarel)
@@ -195,6 +195,17 @@ struct Elf {
         return nullptr;
     }
 
+    std::string ptrDebug(uint64_t vma) const {
+        // search all section headers to see which contain this vma.
+        for (auto&& sec : sHeaders) {
+            auto&& sh = sec.sHeader;
+            if (vma >= sh.sh_addr && vma < sh.sh_addr + sh.sh_size) {
+                return fmt::format("[{:#x} = <{} + {:#x}>]", vma, sec.name, vma - sh.sh_addr);
+            }
+        }
+        return fmt::format("[{:#x}]", vma);
+    }
+
     std::string_view image;
     Elf64_Ehdr eHeader;
     std::vector<ProgramHeader> pHeaders;
@@ -235,6 +246,7 @@ struct Fde {
     uint64_t pcRange;
     std::string augmentationData;
     uint64_t lsdaAddr = 0;
+    std::string instructions;
 };
 
 struct Cfi {
@@ -321,13 +333,12 @@ uint64_t Cfi::decodeDwarfInner(uint8_t encoding, std::string_view& data /* inout
     switch (encoding & DW_EH_PE_APPL_MASK) {
         case DW_EH_PE_pcrel:
             auto raw = r;
-            r = sec->sHeader.sh_addr + raw + (save.data() - secData().data());
+            uint64_t secVma = sec->sHeader.sh_addr;
+            uint64_t secOffset = save.data() - secData().data();
+            r = secVma + secOffset + raw;
             std::cout << fmt::format(
-                    "   [apply pcrel: mem:{:#x} + raw:{:#x} + offset:{:#x} = {:#x}]\n",
-                    sec->sHeader.sh_addr,
-                    raw,
-                    save.data() - secData().data(),
-                    r);
+                    "   [pcrel: secVMA:{:#x} + secOffset:{:#x} + raw:{:#x} = {:#x}]\n",
+                    secVma, secOffset, raw, r);
             break;
     }
 
@@ -426,23 +437,27 @@ bool Cfi::scanFde(std::string_view data, uint32_t startPosition, uint32_t cieId)
     }
 
     fde.pcBegin = decodeDwarf(associatedCie->addressEnc, data);
-    std::cout << fmt::format("   .pcBegin: {:#x}\n", fde.pcBegin);
-
-    // Same format as pcBegin, but only uses an absolute apply rule. (libunwind:src/dwarf/Gfde.c)
+    fmt::print("   .pcBegin: {:#x}\n", fde.pcBegin);
+    // pcRange is same format as pcBegin, ignores the apply rule. (libunwind:src/dwarf/Gfde.c)
     fde.pcRange = decodeDwarf(associatedCie->addressEnc & DW_EH_PE_FORMAT_MASK, data);
-    std::cout << fmt::format("   .pcRange: {:#x}\n", fde.pcRange);
+    fmt::print("   .pcRange: {:#x}, [ range: {} .. {} ]\n",
+               fde.pcRange,
+               elf->ptrDebug(fde.pcBegin),
+               elf->ptrDebug(fde.pcBegin + fde.pcRange));
 
-#if 0
     if (associatedCie->hasAugmentation()) {
-        uint64_t n = decodeDwarf(DW_EH_PE_uleb128, sectionData.data(), entryPos);
-        std::copy_n(sectionData.data() + entryPos, n, std::back_inserter(fde.augmentationData));
-        std::cout << fmt::format("   .augmentationData[{}]: {}\n", n, hexString(fde.augmentationData));
+        uint64_t n = decodeDwarf(DW_EH_PE_uleb128, data);
+        fde.augmentationData = data.substr(0, n);
+        // data.remove_prefix(n);
+        fmt::print("   .augmentationData[{}]: {}\n", n, hexString(fde.augmentationData));
+
         if (associatedCie->lsdaEnc != DW_EH_PE_omit) {
-            fde.lsdaAddr = decodeDwarf(associatedCie->lsdaEnc, sectionData.data(), entryPos);
-            std::cout << fmt::format("   .lsda: {}\n", n, hexInt(fde.lsdaAddr));
+            fde.lsdaAddr = decodeDwarf(associatedCie->lsdaEnc, data);
+            fmt::print("   .lsda: {}\n", elf->ptrDebug(fde.lsdaAddr));
         }
     }
-#endif
+    fde.instructions = data;
+    fmt::print("   .instructions: {}\n", hexString(fde.instructions));
 
     fdeVec.push_back(std::move(fde));
     return true;
@@ -545,7 +560,7 @@ public:
 
             if (verboseElfDecode) {
                 fmt::print("Segment header #{}, hdrAt: {:#x}\n", phi, pho);
-                auto hdrDump = [](const char* field, auto x) { return fmt::print("  .{}: {:#x}\n", field, x); };
+                auto hdrDump = [](const char* field, auto x) { return fmt::print("  .{:<16}: {:#10x}\n", field, x); };
 #define HDRF_(f) hdrDump(#f, pHeader.f)
                 HDRF_(p_type);         /* Segment type */
                 HDRF_(p_flags);        /* Segment flags */
@@ -620,7 +635,7 @@ public:
             auto& s = elf.sHeaders[shi];
             fmt::print("Section header #{}, hdrAt: {:#x}, name: \"{}\"\n", shi, s.hdrAt, s.name);
             if (verboseElfDecode) {
-                auto hdrDump = [](const char* field, auto x) { fmt::print("  .{}: {:#x}\n", field, x); };
+                auto hdrDump = [](const char* field, auto x) { fmt::print("  .{:<16}: {:#10x}\n", field, x); };
 #define HDRF_(f) hdrDump(#f, s.sHeader.f)
                 HDRF_(sh_name);                /* Section name (string tbl index) */
                 HDRF_(sh_type);                /* Section type */
