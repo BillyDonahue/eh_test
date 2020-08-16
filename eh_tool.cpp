@@ -176,6 +176,79 @@ int64_t decodeSLEB128(std::string_view& data) {
     return val;
 }
 
+template <typename T>
+T readInteger(std::string_view& data) {
+    T t;
+    std::copy_n(data.begin(), sizeof(t), reinterpret_cast<char*>(&t));
+    data.remove_prefix(sizeof(t));
+    return t;
+}
+
+
+uint64_t decodeDwarfGenericInner(uint8_t encoding,
+                                 std::string_view elfImage,
+                                 uint64_t secAddr,
+                                 std::string_view secImage,
+                                 std::string_view& data /* inout */) {
+    std::string_view save = data;
+    uint64_t r = 0;
+    // Low nybble determines numeric encoding
+    switch (encoding & DW_EH_PE_FORMAT_MASK) {
+        case DW_EH_PE_uleb128:
+            r = decodeULEB128(data);
+            break;
+        case DW_EH_PE_udata2:
+            r = readInteger<uint16_t>(data);
+            break;
+        case DW_EH_PE_udata4:
+            r = readInteger<uint32_t>(data);
+            break;
+        case DW_EH_PE_udata8:
+        case DW_EH_PE_absptr:
+            r = readInteger<uint64_t>(data);
+            break;
+        case DW_EH_PE_sleb128:
+            r = static_cast<uint64_t>(decodeSLEB128(data));
+            break;
+        case DW_EH_PE_sdata2:
+            r = static_cast<uint64_t>(readInteger<int16_t>(data));
+            break;
+        case DW_EH_PE_sdata4:
+            r = static_cast<uint64_t>(readInteger<int32_t>(data));
+            break;
+        case DW_EH_PE_sdata8:
+            r = static_cast<uint64_t>(readInteger<int64_t>(data));
+            break;
+    }
+
+    // High nybble specifies contextual adjustments applied to the numeric value:
+    switch (encoding & DW_EH_PE_APPL_MASK) {
+        case DW_EH_PE_pcrel:
+            auto raw = r;
+            uint64_t secOffset = save.data() - secImage.data();
+            r = secAddr + secOffset + raw;
+            std::cout << fmt::format(
+                    "   [pcrel: secAddr:{:#x} + secOffset:{:#x} + raw:{:#x} = {:#x}]\n",
+                    secAddr, secOffset, raw, r);
+            break;
+    }
+
+    return r;
+}
+
+uint64_t decodeDwarfGeneric(uint8_t encoding, std::string_view elfImage, uint64_t secAddr,
+                            std::string_view secImage, std::string_view& data /* inout */) {
+    std::string_view save = data;
+    uint64_t pos = save.data() - elfImage.data();
+    auto r = decodeDwarfGenericInner(encoding, elfImage, secAddr, secImage, data);
+    if (verboseDwarfDecode) {
+        std::string_view consumed(save.data(), data.data() - save.data());
+        fmt::print("   [decodeDwarf: pos: {:#x}, raw: {}, enc: {}]\n",
+                   pos, hexString(consumed), encStr(encoding));
+    }
+    return r;
+}
+
 struct Elf {
     struct ProgramHeader {
         size_t hdrAt;
@@ -194,6 +267,14 @@ struct Elf {
                 return &s;
         return nullptr;
     }
+
+    uint8_t readByte(std::string_view& data) const {
+        uint8_t r = data.at(0);
+        data.remove_prefix(1);
+        fmt::print("   [readByte at {:#10x}: {:#04x}]\n", data.data() - image.data(), +r);
+        return r;
+    }
+
 
     std::string ptrDebug(uint64_t vma) const {
         // search all section headers to see which contain this vma.
@@ -249,13 +330,89 @@ struct Fde {
     std::string instructions;
 };
 
+struct Lsda {
+    uint64_t addr;
+    bool hasLpBase;
+    uint64_t lpBase;
+    uint64_t ttStart;
+    uint8_t csEnc;
+    uint64_t csSize;
+    uint64_t actionStart;
+};
+
+class LsdaScan {
+public:
+    LsdaScan(const Elf* elf) : elf(elf) {
+        sec = elf->findSection(".gcc_except_table");
+    }
+
+    /**
+        A 1 byte encoding of the following field (a DW_EH_PE_xxx value).
+
+        If the encoding is not DW_EH_PE_omit, the landing pad base. This is the
+        base from which landing pad offsets are computed. If this is omitted, the
+        base comes from calling _Unwind_GetRegionStart, which returns the beginning
+        of the code described by the current FDE. In practice this field is
+        normally omitted.
+
+        A 1 byte encoding of the entries in the type table (a DW_EH_PE_xxx value).
+
+        If the encoding is not DW_EH_PE_omit, the types table pointer. This is an
+        unsigned LEB128 value, and is the byte offset from this field to the start
+        of the types table used for exception matching.
+
+        A 1 byte encoding of the fields in the call-site table (a DW_EH_PE_xxx value).
+
+        An unsigned LEB128 value holding the length in bytes of the call-site table.
+     */
+    Lsda scan(uint64_t addr) {
+        Lsda lsda{};
+        fmt::print("[LSDA] at {}\n", elf->ptrDebug(addr));
+        lsda.addr = addr;
+        std::string_view data = elf->image.substr(addr);
+        uint8_t lpBaseEnc = elf->readByte(data);
+        fmt::print("    .landingPadBaseEncoding: {}\n", encStr(lpBaseEnc));
+        if (lpBaseEnc != DW_EH_PE_omit) {
+            lsda.hasLpBase = true;
+            lsda.lpBase = decodeDwarf(lpBaseEnc, data);
+            fmt::print("    .lpBase: {}\n", encStr(lsda.lpBase));
+        }
+        uint8_t ttEnc = elf->readByte(data);
+        if (ttEnc != DW_EH_PE_omit) {
+            fmt::print("    .ttEnc: {}\n", encStr(ttEnc));
+            lsda.ttStart = decodeDwarf(DW_EH_PE_uleb128 | DW_EH_PE_pcrel, data);
+        } else {
+            lsda.ttStart = 0;
+        }
+        fmt::print("    .ttStart: {}\n", elf->ptrDebug(lsda.ttStart));
+
+        lsda.csEnc = elf->readByte(data);
+        fmt::print("    .csEnc: {}\n", encStr(lsda.csEnc));
+        lsda.csSize = decodeDwarf(DW_EH_PE_uleb128, data);
+        fmt::print("    .csSize: {:#x}\n", lsda.csSize);
+        lsda.actionStart = sec->sHeader.sh_addr + (data.data() - secData().data()) + lsda.csSize;
+        fmt::print("    .actionStart: {}\n", elf->ptrDebug(lsda.actionStart));
+        return lsda;
+    }
+
+    uint64_t decodeDwarf(uint8_t enc, std::string_view& data) const {
+        return decodeDwarfGeneric(enc, elf->image, sec->sHeader.sh_addr, secData(), data);
+    }
+
+    std::string_view secData() const {
+        return elf->image.substr(sec->sHeader.sh_offset, sec->sHeader.sh_size);
+    }
+
+    const Elf* elf;
+    const Elf::SectionHeader* sec;
+};
+
 struct Cfi {
 public:
     Cfi(const Elf* elf, const Elf::SectionHeader* sec) : elf(elf), sec(sec) {}
 
     void scan();
 
-    uint8_t readByte(std::string_view& data);
     uint64_t decodeDwarf(uint8_t encoding, std::string_view& data);
 
     const Cie* cieLookup(uint64_t ciePos) {
@@ -289,86 +446,20 @@ public:
 };
 
 
-template <typename T>
-T readInteger(std::string_view& data) {
-    T t;
-    std::copy_n(data.begin(), sizeof(t), reinterpret_cast<char*>(&t));
-    data.remove_prefix(sizeof(t));
-    return t;
-}
-
-uint64_t Cfi::decodeDwarfInner(uint8_t encoding, std::string_view& data /* inout */) {
-    std::string_view save = data;
-    uint64_t r = 0;
-    // Low nybble determines numeric encoding
-    switch (encoding & DW_EH_PE_FORMAT_MASK) {
-        case DW_EH_PE_uleb128:
-            r = decodeULEB128(data);
-            break;
-        case DW_EH_PE_udata2:
-            r = readInteger<uint16_t>(data);
-            break;
-        case DW_EH_PE_udata4:
-            r = readInteger<uint32_t>(data);
-            break;
-        case DW_EH_PE_udata8:
-        case DW_EH_PE_absptr:
-            r = readInteger<uint64_t>(data);
-            break;
-        case DW_EH_PE_sleb128:
-            r = static_cast<uint64_t>(decodeSLEB128(data));
-            break;
-        case DW_EH_PE_sdata2:
-            r = static_cast<uint64_t>(readInteger<int16_t>(data));
-            break;
-        case DW_EH_PE_sdata4:
-            r = static_cast<uint64_t>(readInteger<int32_t>(data));
-            break;
-        case DW_EH_PE_sdata8:
-            r = static_cast<uint64_t>(readInteger<int64_t>(data));
-            break;
-    }
-
-    // High nybble specifies contextual adjustments applied to the numeric value:
-    switch (encoding & DW_EH_PE_APPL_MASK) {
-        case DW_EH_PE_pcrel:
-            auto raw = r;
-            uint64_t secVma = sec->sHeader.sh_addr;
-            uint64_t secOffset = save.data() - secData().data();
-            r = secVma + secOffset + raw;
-            std::cout << fmt::format(
-                    "   [pcrel: secVMA:{:#x} + secOffset:{:#x} + raw:{:#x} = {:#x}]\n",
-                    secVma, secOffset, raw, r);
-            break;
-    }
-
-    return r;
-}
-
-uint8_t Cfi::readByte(std::string_view& data) {
-    uint8_t r = data.at(0);
-    data.remove_prefix(1);
-    fmt::print("   [readByte at {:#10x}: {:#04x}]\n", data.data() - elfImage().data(), +r);
-    return r;
-}
-
 uint64_t Cfi::decodeDwarf(uint8_t encoding, std::string_view& data) {
-    std::string_view save = data;
-    uint64_t pos = save.data() - elfImage().data();
-    auto r = decodeDwarfInner(encoding, data);
-    if (verboseDwarfDecode) {
-        std::string_view consumed(save.data(), data.data() - save.data());
-        fmt::print("   [decodeDwarf: pos: {:#x}, raw: {}, enc: {}]\n",
-                   pos, hexString(consumed), encStr(encoding));
-    }
-    return r;
+    return decodeDwarfGeneric(
+            encoding,
+            elf->image,
+            sec->sHeader.sh_addr,
+            elf->image.substr(sec->sHeader.sh_offset, sec->sHeader.sh_size),
+            data);
 }
 
 bool Cfi::scanCie(std::string_view data, uint32_t startPosition) {
     fmt::print("[CIE]\n");
     Cie cie{};
     cie.pos = startPosition;
-    cie.version = readByte(data);
+    cie.version = elf->readByte(data);
     fmt::print("  .version: {:#4x}\n", cie.version);
     while (!data.empty()) {
         char c = data.front();
@@ -386,7 +477,7 @@ bool Cfi::scanCie(std::string_view data, uint32_t startPosition) {
     fmt::print("  .codeAlign: {}\n", cie.codeAlign);
     cie.dataAlign = decodeDwarf(DW_EH_PE_sleb128, data);
     fmt::print("  .dataAlign: {}\n", cie.dataAlign);
-    cie.returnRegister = readByte(data);
+    cie.returnRegister = elf->readByte(data);
     fmt::print("  .returnRegister: {}\n", cie.returnRegister);
     if (cie.hasAugmentation()) {
         uint64_t len = decodeDwarf(DW_EH_PE_uleb128, data);
@@ -398,19 +489,25 @@ bool Cfi::scanCie(std::string_view data, uint32_t startPosition) {
         for (size_t strPos = 1; strPos != cie.augmentationString.size(); ++strPos) {
             switch (cie.augmentationString[strPos]) {
                 case 'L':
-                    cie.lsdaEnc = readByte(aug);
+                    cie.lsdaEnc = elf->readByte(aug);
                     fmt::print("    .lsdaEnc: {}\n", encStr(cie.lsdaEnc));
                     break;
                 case 'P':
                     // Encodes encoding spec for a pointer, then the pointer.
-                    cie.personalityEnc = readByte(aug);
+                    cie.personalityEnc = elf->readByte(aug);
                     fmt::print("    .personalityEnc: {}\n", encStr(cie.personalityEnc));
                     cie.personality = decodeDwarf(cie.personalityEnc, aug);
-                    fmt::print("    .personality: {:1}{:#10x}\n",
-                               (cie.personalityEnc & DW_EH_PE_indirect) ? "*" : "", cie.personality);
+                    fmt::print("    .personality: {:1}{}\n",
+                               (cie.personalityEnc & DW_EH_PE_indirect) ? "*" : "", elf->ptrDebug(cie.personality));
+                    if (cie.personalityEnc & DW_EH_PE_indirect) {
+                        auto persLoc = elfImage().substr(cie.personality, 8);
+                        uint64_t pers = decodeDwarf(DW_EH_PE_udata8, persLoc);
+                        fmt::print("        [* {} = {}]\n", elf->ptrDebug(cie.personality), elf->ptrDebug(pers));
+                    }
+
                     break;
                 case 'R':
-                    cie.addressEnc = readByte(aug);
+                    cie.addressEnc = elf->readByte(aug);
                     fmt::print("    .addressEnc: {}\n", encStr(cie.addressEnc));
                     break;
             }
@@ -454,6 +551,9 @@ bool Cfi::scanFde(std::string_view data, uint32_t startPosition, uint32_t cieId)
         if (associatedCie->lsdaEnc != DW_EH_PE_omit) {
             fde.lsdaAddr = decodeDwarf(associatedCie->lsdaEnc, data);
             fmt::print("   .lsda: {}\n", elf->ptrDebug(fde.lsdaAddr));
+
+            LsdaScan lsdaScan{elf};
+            Lsda lsda = lsdaScan.scan(fde.lsdaAddr);
         }
     }
     fde.instructions = data;
